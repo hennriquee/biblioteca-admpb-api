@@ -12,10 +12,12 @@
  * aproximado, pois nao ha como confirmar com certeza.
  *
  * Para a CAPA, se nenhuma das fontes acima trouxer imagem, ainda tentamos,
- * nessa ordem: a) busca publica do Mercado Livre, primeiro por ISBN (raro
- * achar, mas confiavel quando acha) e depois por titulo+autor (acha muito
- * mais, com uma checagem mais fraca de similaridade de titulo); b) busca de
- * imagens no DuckDuckGo; c) padrao de URL de capa da Amazon (chute final).
+ * nessa ordem: a) busca de imagens no DuckDuckGo (a que mais acha capa de
+ * livro nacional, e nao exige correspondencia tao rigida quanto o Mercado
+ * Livre); b) busca publica do Mercado Livre, primeiro por ISBN (raro achar,
+ * mas confiavel quando acha) e depois por titulo+autor (acha mais, com uma
+ * checagem mais fraca de similaridade de titulo); c) padrao de URL de capa
+ * da Amazon (chute final, so entra se nada acima funcionar).
  *
  * O Node 20+ ja tem fetch nativo, entao nao precisamos instalar nada.
  */
@@ -407,16 +409,19 @@ export async function lookupIsbn(isbn) {
   // A partir daqui sao todas fontes "duvidosas" (nao-oficiais ou instaveis).
   // Cada uma passa pelo safely(): se quebrar por qualquer motivo, vira ""
   // e a gente so tenta a proxima, sem propagar erro nenhum pra fora.
+  // Ordem: DuckDuckGo primeiro (maior chance de achar capa de livro
+  // nacional) -> Mercado Livre (reforco) -> Amazon (chute final, so entra
+  // se nada acima funcionar).
   if (!result.cover) {
     result.cover = await safely(
-      coverFromMercadoLivre(isbn, result.title, result.authors),
+      coverFromDuckDuckGo(result.title, result.authors),
       "",
     );
   }
 
   if (!result.cover) {
     result.cover = await safely(
-      coverFromDuckDuckGo(result.title, result.authors),
+      coverFromMercadoLivre(isbn, result.title, result.authors),
       "",
     );
   }
