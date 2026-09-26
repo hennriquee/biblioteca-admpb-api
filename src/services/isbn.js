@@ -322,6 +322,34 @@ async function metadataFromDuckDuckGo(isbn) {
   };
 }
 
+async function coverFromOpenLibraryDirect(isbn) {
+  // Endpoint OFICIAL da Open Library que serve capa direto pelo ISBN, sem
+  // precisar de busca previa (search.json) nem de scraping. Com
+  // "?default=false" ela devolve 404 quando nao tem capa, em vez do
+  // placeholder generico cinza - entao um 200 aqui e confirmacao real de
+  // que existe imagem, ao contrario do chute de URL da Amazon. Por ser
+  // endpoint publico e documentado, nao costuma bloquear IP de datacenter
+  // como o Mercado Livre e o DuckDuckGo fazem.
+  const checkUrl =
+    "https://covers.openlibrary.org/b/isbn/" + isbn + "-L.jpg?default=false";
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const response = await fetch(checkUrl, {
+      method: "HEAD",
+      signal: controller.signal,
+      headers: { "User-Agent": USER_AGENT },
+    });
+    if (!response.ok) return "";
+    return "https://covers.openlibrary.org/b/isbn/" + isbn + "-L.jpg";
+  } catch (error) {
+    console.error("Falha ao checar capa na Open Library:", error.message);
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function coverFromMercadoLivre(isbn, title, authors) {
   // 1a tentativa: buscar pelo proprio ISBN. Poucos vendedores colocam o
   // ISBN no titulo do anuncio, entao isso raramente acha algo - mas quando
@@ -404,9 +432,17 @@ export async function lookupIsbn(isbn) {
 
   if (!result || !result.title) return null;
 
-  // A partir daqui sao todas fontes "duvidosas" (nao-oficiais ou instaveis).
-  // Cada uma passa pelo safely(): se quebrar por qualquer motivo, vira ""
-  // e a gente so tenta a proxima, sem propagar erro nenhum pra fora.
+  // A partir daqui sao todas fontes de reforco. Cada uma passa pelo
+  // safely(): se quebrar por qualquer motivo, vira "" e a gente so tenta a
+  // proxima, sem propagar erro nenhum pra fora.
+  // Ordem: Open Library direta primeiro (endpoint oficial, confirmado com
+  // ?default=false, nao costuma bloquear IP de servidor) -> Mercado Livre
+  // -> DuckDuckGo -> Amazon (chute final, sem nenhuma garantia).
+  if (!result.cover) {
+    result.cover = await safely(coverFromOpenLibraryDirect(isbn), "");
+    if (result.cover) console.log("[capa] achou na Open Library:", isbn);
+  }
+
   if (!result.cover) {
     result.cover = await safely(
       coverFromMercadoLivre(isbn, result.title, result.authors),
