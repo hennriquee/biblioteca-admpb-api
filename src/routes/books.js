@@ -135,7 +135,7 @@ router.get("/cover-search", async (req, res, next) => {
 router.get("/:id", async (req, res, next) => {
   try {
     const book = await Book.findById(req.params.id).lean();
-    if (!book) return res.status(404).json({ error: "Livro nao encontrado." });
+    if (!book) return res.status(404).json({ error: "Livro não encontrado." });
     return res.json(book);
   } catch (error) {
     return next(error);
@@ -209,7 +209,7 @@ router.put("/:id", async (req, res, next) => {
       runValidators: true,
     });
 
-    if (!book) return res.status(404).json({ error: "Livro nao encontrado." });
+    if (!book) return res.status(404).json({ error: "Livro não encontrado." });
 
     // Mantem os cards de emprestimo ativos com o titulo/capa atualizados.
     await Loan.updateMany(
@@ -245,7 +245,7 @@ router.delete("/:id", async (req, res, next) => {
     }
 
     const book = await Book.findByIdAndDelete(req.params.id);
-    if (!book) return res.status(404).json({ error: "Livro nao encontrado." });
+    if (!book) return res.status(404).json({ error: "Livro não encontrado." });
 
     return res.json({ ok: true });
   } catch (error) {

@@ -58,7 +58,7 @@ app.use("/api/people", peopleRoutes);
 
 // Rota nao encontrada
 app.use((req, res) => {
-  res.status(404).json({ error: "Rota nao encontrada." });
+  res.status(404).json({ error: "Rota não encontrada." });
 });
 
 // Tratador de erros central

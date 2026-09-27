@@ -41,7 +41,7 @@ router.get("/:id", async (req, res, next) => {
   try {
     const loan = await Loan.findById(req.params.id).populate("book").lean();
     if (!loan)
-      return res.status(404).json({ error: "Empréstimo nao encontrado." });
+      return res.status(404).json({ error: "Empréstimo não encontrado." });
     return res.json(loan);
   } catch (error) {
     return next(error);
@@ -71,7 +71,7 @@ router.post("/", async (req, res, next) => {
       return res.status(400).json({ error: "Informe a data de retirada." });
 
     const book = await Book.findById(bookId);
-    if (!book) return res.status(404).json({ error: "Livro nao encontrado." });
+    if (!book) return res.status(404).json({ error: "Livro não encontrado." });
 
     const bookIsOut = await Loan.findOne({ book: book._id, status: "ativo" });
     if (bookIsOut) {
@@ -132,7 +132,7 @@ router.patch("/:id/return", async (req, res, next) => {
   try {
     const loan = await Loan.findById(req.params.id);
     if (!loan)
-      return res.status(404).json({ error: "Empréstimo nao encontrado." });
+      return res.status(404).json({ error: "Empréstimo não encontrado." });
     if (loan.status === "devolvido") {
       return res
         .status(409)
@@ -154,7 +154,7 @@ router.delete("/:id", async (req, res, next) => {
   try {
     const loan = await Loan.findByIdAndDelete(req.params.id);
     if (!loan)
-      return res.status(404).json({ error: "Emprestimo nao encontrado." });
+      return res.status(404).json({ error: "Emprestimo não encontrado." });
     return res.json({ ok: true });
   } catch (error) {
     return next(error);
