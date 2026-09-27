@@ -2,7 +2,7 @@ import { Router } from "express";
 import Book, { normalizeText } from "../models/Book.js";
 import Loan from "../models/Loan.js";
 import { requireAuth } from "../middleware/auth.js";
-import { lookupIsbn } from "../services/isbn.js";
+import { lookupIsbn, searchCoverImages } from "../services/isbn.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -108,6 +108,24 @@ router.get("/lookup/:isbn", async (req, res, next) => {
     }
 
     return res.json({ ...data, alreadyRegistered: Boolean(existing) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// GET /api/books/cover-search?q=texto -> busca capas por texto livre
+// (usado quando a pessoa cola um link de busca do Google Imagens que nao
+// tem nenhuma imagem embutida nele, so o texto pesquisado - ex: link do
+// celular no formato google.com/search?q=...&udm=2 - ou quando digita a
+// busca direto no modal "Buscar foto na internet").
+router.get("/cover-search", async (req, res, next) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    if (!q) {
+      return res.status(400).json({ error: "Informe o que buscar." });
+    }
+    const results = await searchCoverImages(q);
+    return res.json({ results });
   } catch (error) {
     return next(error);
   }

@@ -212,36 +212,10 @@ function normalize(text) {
 }
 
 async function coverFromDuckDuckGo(title, authors) {
-  // Reproduz o que a aba "Imagens" do DuckDuckGo faz, mas usando o endpoint
-  // interno que o proprio site usa (nao e uma API oficial nem documentada -
-  // e engenharia reversa, entao pode parar de funcionar sem aviso).
-  // Fluxo: 1) abre a pagina de busca normal so para pegar um token "vqd"
-  // que ela exige; 2) usa esse token para chamar o endpoint de imagens,
-  // que devolve JSON com os resultados.
   if (!title) return "";
   const query =
     "capa livro " + title + (authors && authors[0] ? " " + authors[0] : "");
-
-  const html = await fetchText(
-    "https://duckduckgo.com/?q=" +
-      encodeURIComponent(query) +
-      "&iax=images&ia=images",
-  );
-  if (!html) return "";
-
-  const vqdMatch = html.match(/vqd=['"]?([\d-]+)['"&]/);
-  const vqd = vqdMatch && vqdMatch[1];
-  if (!vqd) return "";
-
-  const data = await fetchJson(
-    "https://duckduckgo.com/i.js?l=br-pt&o=json&q=" +
-      encodeURIComponent(query) +
-      "&vqd=" +
-      vqd +
-      "&f=,,,&p=1",
-    { Referer: "https://duckduckgo.com/" },
-  );
-  const results = data && Array.isArray(data.results) ? data.results : [];
+  const results = await duckDuckGoImageResults(query);
   if (!results.length) return "";
 
   // Mesma checagem de similaridade usada no Mercado Livre: so aceita se a
@@ -260,6 +234,61 @@ async function coverFromDuckDuckGo(title, authors) {
   return chosen && (chosen.image || chosen.thumbnail)
     ? chosen.image || chosen.thumbnail
     : "";
+}
+
+// Reproduz o que a aba "Imagens" do DuckDuckGo faz, mas usando o endpoint
+// interno que o proprio site usa (nao e uma API oficial nem documentada -
+// e engenharia reversa, entao pode parar de funcionar sem aviso).
+// Fluxo: 1) abre a pagina de busca normal so para pegar um token "vqd"
+// que ela exige; 2) usa esse token para chamar o endpoint de imagens,
+// que devolve JSON com os resultados. Usada tanto para achar capa por
+// ISBN (com titulo+autor) quanto para a busca livre de capa (texto que a
+// pessoa digitou ou colou de um link de busca do Google que nao trouxe
+// imagem nenhuma dentro dele, so o texto pesquisado).
+async function duckDuckGoImageResults(query) {
+  if (!query) return [];
+
+  const html = await fetchText(
+    "https://duckduckgo.com/?q=" +
+      encodeURIComponent(query) +
+      "&iax=images&ia=images",
+  );
+  if (!html) return [];
+
+  const vqdMatch = html.match(/vqd=['"]?([\d-]+)['"&]/);
+  const vqd = vqdMatch && vqdMatch[1];
+  if (!vqd) return [];
+
+  const data = await fetchJson(
+    "https://duckduckgo.com/i.js?l=br-pt&o=json&q=" +
+      encodeURIComponent(query) +
+      "&vqd=" +
+      vqd +
+      "&f=,,,&p=1",
+    { Referer: "https://duckduckgo.com/" },
+  );
+  return data && Array.isArray(data.results) ? data.results : [];
+}
+
+// Versao para busca livre (a pessoa digitou um texto, ou colou um link de
+// busca do Google Imagens que nao trouxe nenhuma imagem embutida - so o
+// texto pesquisado, tipo "google.com/search?q=...&udm=2"). Sem titulo de
+// livro pra comparar, nao da pra validar similaridade como no ISBN: so
+// devolvemos os melhores resultados crus para a pessoa escolher na tela.
+export async function searchCoverImages(query, limit = 8) {
+  const cleanQuery = String(query || "").trim();
+  if (!cleanQuery) return [];
+
+  const results = await safely(duckDuckGoImageResults(cleanQuery), []);
+  return results
+    .filter((item) => item && (item.image || item.thumbnail))
+    .slice(0, limit)
+    .map((item) => ({
+      title: item.title || "",
+      image: item.image || item.thumbnail,
+      thumbnail: item.thumbnail || item.image,
+      source: item.url || "",
+    }));
 }
 
 // Tira tags HTML e decodifica entidades basicas (&amp;, &#39; etc) de um
