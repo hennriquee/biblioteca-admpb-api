@@ -76,7 +76,7 @@ router.post("/", async (req, res, next) => {
     const bookIsOut = await Loan.findOne({ book: book._id, status: "ativo" });
     if (bookIsOut) {
       return res.status(409).json({
-        error: "Esse livro ja esta com " + bookIsOut.personName + ".",
+        error: "Esse livro ja está com " + bookIsOut.personName + ".",
       });
     }
 
@@ -93,7 +93,7 @@ router.post("/", async (req, res, next) => {
           code: "PERSON_HAS_ACTIVE_LOAN",
           error:
             personName +
-            " ja esta com " +
+            " já está com " +
             openLoans.map((l) => l.bookTitle).join(", ") +
             ".",
           activeLoans: openLoans,

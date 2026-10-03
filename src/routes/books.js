@@ -268,7 +268,10 @@ router.put("/:id", async (req, res, next) => {
     // A foto antiga ficou sem uso: apaga no Cloudinary e, nos emprestimos ja
     // devolvidos (que ainda ficam alguns dias no historico), troca a capa
     // para nao apontar para uma imagem que deixou de existir.
-    if (previous.coverPublicId && previous.coverPublicId !== book.coverPublicId) {
+    if (
+      previous.coverPublicId &&
+      previous.coverPublicId !== book.coverPublicId
+    ) {
       await deleteCover(previous.coverPublicId);
       await Loan.updateMany(
         { book: book._id, status: { $ne: "ativo" } },
@@ -293,7 +296,7 @@ router.delete("/:id", async (req, res, next) => {
     if (activeLoan) {
       return res.status(409).json({
         error:
-          "Esse livro esta emprestado para " +
+          "Esse livro está emprestado para " +
           activeLoan.personName +
           ". Confirme a devolucao antes de excluir.",
       });
