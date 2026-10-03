@@ -7,15 +7,21 @@
  * 3) Google Books (googleapis.com/books) - usado como reforco quando disponivel
  *
  * Se as tres acima nao acharem NEM O TITULO (livro nao cadastrado em
- * nenhuma), tentamos como ultimissimo recurso 4) uma busca de texto no
- * DuckDuckGo so para adivinhar o titulo - o dado vem marcado como
- * aproximado, pois nao ha como confirmar com certeza.
+ * nenhuma), tentamos como reforco 4) o SerpAPI (busca do Google, precisa da
+ * SERP_API_KEY no .env) e, por ultimo, 5) uma busca de texto no DuckDuckGo
+ * so para adivinhar o titulo - esses dados vem marcados como aproximados,
+ * pois nao ha como confirmar com certeza.
  *
  * Para a CAPA, se nenhuma das fontes acima trouxer imagem, ainda tentamos,
- * nessa ordem: a) busca publica do Mercado Livre, primeiro por ISBN (raro
- * achar, mas confiavel quando acha) e depois por titulo+autor (acha muito
- * mais, com uma checagem mais fraca de similaridade de titulo); b) busca de
- * imagens no DuckDuckGo; c) padrao de URL de capa da Amazon (chute final).
+ * nessa ordem: a) capa direta da Open Library (endpoint oficial); b) imagens
+ * do Google via SerpAPI; c) busca publica do Mercado Livre, primeiro por ISBN
+ * (raro achar, mas confiavel quando acha) e depois por titulo+autor (acha
+ * muito mais, com uma checagem mais fraca de similaridade de titulo);
+ * d) busca de imagens no DuckDuckGo; e) padrao de URL de capa da Amazon
+ * (chute final).
+ *
+ * O SerpAPI tem cota mensal limitada no plano gratis, por isso ele so e
+ * chamado quando as fontes sem custo nao resolveram.
  *
  * O Node 20+ ja tem fetch nativo, entao nao precisamos instalar nada.
  */
@@ -93,6 +99,148 @@ async function safely(promise, fallback) {
     );
     return fallback;
   }
+}
+
+// ---------------------------------------------------------------------------
+// SerpAPI (https://serpapi.com): busca do Google via API. Precisa da chave
+// SERP_API_KEY no .env; sem ela, todas as funcoes abaixo simplesmente devolvem
+// vazio e o fluxo segue para as outras fontes.
+//
+// Nao usamos o fetchJson() aqui de proposito: ele escreve a URL inteira no log
+// quando da erro, e a URL do SerpAPI carrega a api_key.
+// ---------------------------------------------------------------------------
+const SERPAPI_TIMEOUT_MS = 15000;
+
+export function isSerpApiConfigured() {
+  return Boolean(process.env.SERP_API_KEY);
+}
+
+async function serpApiSearch(params) {
+  if (!isSerpApiConfigured()) return null;
+
+  const url = new URL("https://serpapi.com/search.json");
+  Object.entries({ hl: "pt-br", gl: "br", ...params }).forEach(([k, v]) =>
+    url.searchParams.set(k, String(v)),
+  );
+  url.searchParams.set("api_key", process.env.SERP_API_KEY);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SERPAPI_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    });
+    const data = await response.json().catch(() => null);
+
+    if (!response.ok || (data && data.error)) {
+      const reason = (data && data.error) || "HTTP " + response.status;
+      // "Google hasn't returned any results" e resposta normal de busca vazia.
+      if (!/hasn't returned any results/i.test(reason)) {
+        console.error("SerpAPI (" + params.engine + ") recusou a busca:", reason);
+      }
+      return null;
+    }
+    return data;
+  } catch (error) {
+    console.error("SerpAPI (" + params.engine + ") falhou:", error.message);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Titulo/autor "adivinhados" a partir de uma busca no Google por "isbn <n>".
+// Prefere o painel de conhecimento (knowledge_graph) quando ele e de um livro;
+// senao usa o titulo do primeiro resultado organico que pareca um livro.
+async function metadataFromSerpApi(isbn) {
+  const data = await serpApiSearch({
+    engine: "google",
+    q: "isbn " + isbn + " livro",
+    num: 5,
+  });
+  if (!data) return null;
+
+  const kg = data.knowledge_graph;
+  const kgIsBook =
+    kg && kg.title && /livro|book|romance|novel|fic[cç][aã]o/i.test(kg.type || "");
+
+  let title = "";
+  let authors = [];
+  let synopsis = "";
+
+  if (kgIsBook) {
+    title = String(kg.title).trim();
+    const rawAuthor = kg.author || kg.authors;
+    if (Array.isArray(rawAuthor)) authors = rawAuthor.map(String);
+    else if (typeof rawAuthor === "string" && rawAuthor.trim())
+      authors = rawAuthor.split(/,| e | and /).map((a) => a.trim());
+    synopsis = typeof kg.description === "string" ? kg.description : "";
+  } else {
+    const organic = Array.isArray(data.organic_results)
+      ? data.organic_results
+      : [];
+    for (const item of organic) {
+      title = guessTitleFromSearchResult(item && item.title);
+      if (title) break;
+    }
+  }
+
+  if (!title) return null;
+
+  return {
+    isbn,
+    title,
+    authors: authors.filter(Boolean),
+    publisher: "",
+    year: "",
+    pages: null,
+    cover: "",
+    synopsis,
+    categories: [],
+    source: "Google via SerpAPI (dado aproximado, confirme antes de usar)",
+  };
+}
+
+// Capa pelo Google Imagens. Capas de livro sao retratos (mais altas que
+// largas), entao descartamos paisagens e imagens minusculas; entre as que
+// sobram, prefere a cujo titulo da pagina mais se parece com o do livro.
+async function coverFromSerpApi(isbn, title, authors) {
+  const query = title
+    ? "capa livro " + title + (authors && authors[0] ? " " + authors[0] : "")
+    : "isbn " + isbn + " capa livro";
+
+  const data = await serpApiSearch({
+    engine: "google_images",
+    q: query,
+  });
+  const results =
+    data && Array.isArray(data.images_results) ? data.images_results : [];
+
+  const portraits = results.filter(
+    (item) =>
+      item &&
+      item.original &&
+      /^https?:\/\//i.test(item.original) &&
+      item.original_height > item.original_width &&
+      item.original_width >= 200,
+  );
+  if (!portraits.length) return "";
+
+  const titleWords = normalize(title)
+    .split(" ")
+    .filter((w) => w.length > 2);
+  const scored = portraits.map((item) => {
+    const haystack = normalize((item.title || "") + " " + (item.source || ""));
+    const hits = titleWords.filter((w) => haystack.includes(w)).length;
+    return { item, ratio: titleWords.length ? hits / titleWords.length : 0 };
+  });
+
+  // Sem titulo para comparar (so temos o ISBN), confia na ordem do Google.
+  const best = titleWords.length
+    ? scored.find((entry) => entry.ratio >= 0.5)
+    : scored[0];
+  return best ? best.item.original : "";
 }
 
 async function fromBrasilApi(isbn) {
@@ -279,7 +427,23 @@ export async function searchCoverImages(query, limit = 8) {
   const cleanQuery = String(query || "").trim();
   if (!cleanQuery) return [];
 
-  const results = await safely(duckDuckGoImageResults(cleanQuery), []);
+  let results = await safely(duckDuckGoImageResults(cleanQuery), []);
+
+  // O DuckDuckGo costuma bloquear IP de servidor. Quando nao devolve nada,
+  // o Google via SerpAPI (se configurado) assume a busca.
+  if (!results.length) {
+    const serp = await safely(
+      serpApiSearch({ engine: "google_images", q: cleanQuery }),
+      null,
+    );
+    results = ((serp && serp.images_results) || []).map((item) => ({
+      title: item.title,
+      image: item.original,
+      thumbnail: item.thumbnail,
+      url: item.link,
+    }));
+  }
+
   return results
     .filter((item) => item && (item.image || item.thumbnail))
     .slice(0, limit)
@@ -451,11 +615,12 @@ export async function lookupIsbn(isbn) {
   let result = merge(merge(brasilApi, google), openLibrary);
 
   if (!result || !result.title) {
-    // Nenhuma fonte estruturada achou o livro. Como ultimo recurso, tenta
-    // adivinhar pelo menos o titulo via busca de texto no DuckDuckGo. So
-    // chega aqui quando a alternativa e devolver null mesmo, entao vale a
-    // pena tentar - mas o dado vem marcado como aproximado no "source".
-    const guess = await safely(metadataFromDuckDuckGo(isbn), null);
+    // Nenhuma fonte estruturada achou o livro. Tenta adivinhar pelo menos o
+    // titulo: primeiro pelo Google (SerpAPI, se houver chave) e, se tambem
+    // nao achar, pelo DuckDuckGo. Em ambos o dado vem marcado como
+    // aproximado no "source".
+    let guess = await safely(metadataFromSerpApi(isbn), null);
+    if (!guess) guess = await safely(metadataFromDuckDuckGo(isbn), null);
     result = merge(result, guess);
   }
 
@@ -465,11 +630,20 @@ export async function lookupIsbn(isbn) {
   // safely(): se quebrar por qualquer motivo, vira "" e a gente so tenta a
   // proxima, sem propagar erro nenhum pra fora.
   // Ordem: Open Library direta primeiro (endpoint oficial, confirmado com
-  // ?default=false, nao costuma bloquear IP de servidor) -> Mercado Livre
-  // -> DuckDuckGo -> Amazon (chute final, sem nenhuma garantia).
+  // ?default=false, nao costuma bloquear IP de servidor) -> Google via
+  // SerpAPI -> Mercado Livre -> DuckDuckGo -> Amazon (chute final, sem
+  // nenhuma garantia).
   if (!result.cover) {
     result.cover = await safely(coverFromOpenLibraryDirect(isbn), "");
     if (result.cover) console.log("[capa] achou na Open Library:", isbn);
+  }
+
+  if (!result.cover) {
+    result.cover = await safely(
+      coverFromSerpApi(isbn, result.title, result.authors),
+      "",
+    );
+    if (result.cover) console.log("[capa] achou no Google (SerpAPI):", isbn);
   }
 
   if (!result.cover) {

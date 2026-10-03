@@ -8,6 +8,7 @@ import authRoutes from "./src/routes/auth.js";
 import bookRoutes from "./src/routes/books.js";
 import loanRoutes from "./src/routes/loans.js";
 import peopleRoutes from "./src/routes/people.js";
+import { requireAuth } from "./src/middleware/auth.js";
 
 const app = express();
 
@@ -29,6 +30,10 @@ app.use(
   }),
 );
 
+// A rota de livros aceita a foto da capa (data URI ~150 KB, ate 4 MB), por
+// isso tem um limite maior. Vem antes do parser geral (1 MB) e so depois de
+// checar o login, para ninguem sem token conseguir mandar corpos grandes.
+app.use("/api/books", requireAuth, express.json({ limit: "6mb" }));
 app.use(express.json({ limit: "1mb" }));
 
 // Protecao contra tentativa de adivinhar a senha: 20 tentativas a cada 15 min.

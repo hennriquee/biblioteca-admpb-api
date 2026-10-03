@@ -11,6 +11,10 @@ const bookSchema = new mongoose.Schema(
     year: { type: String, trim: true, default: '' },
     pages: { type: Number, default: null },
     cover: { type: String, default: '' },
+    // Identificador da foto no Cloudinary. So existe quando a capa foi enviada
+    // pelo app (camera/galeria); capas vindas de link externo ficam vazias aqui.
+    // E por ele que apagamos a foto la quando o livro e excluido ou trocado.
+    coverPublicId: { type: String, default: '' },
     synopsis: { type: String, default: '' },
     categories: { type: [String], default: [] },
     copies: { type: Number, default: 1, min: 1 },
