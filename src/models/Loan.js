@@ -13,6 +13,12 @@ const loanSchema = new mongoose.Schema(
     bookTitleSort: { type: String, index: true },
     personName: { type: String, required: true },
     personNameSort: { type: String, index: true },
+    // WhatsApp (opcional): so digitos com DDI, ex. 5583999998888.
+    // Vazio = sem WhatsApp cadastrado, e o botao de aviso nao aparece.
+    personPhone: { type: String, default: '' },
+    // Marcam quando o administrador abriu o WhatsApp para avisar.
+    reminderSentAt: { type: Date, default: null },
+    overdueSentAt: { type: Date, default: null },
 
     startDate: { type: Date, required: true },
     dueDate: { type: Date, default: null },

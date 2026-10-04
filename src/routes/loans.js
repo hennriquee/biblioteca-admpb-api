@@ -7,6 +7,17 @@ import { requireAuth } from "../middleware/auth.js";
 const router = Router();
 router.use(requireAuth);
 
+// Aceita "(83) 99999-8888", "83999998888" ou "+55 83 99999-8888" e devolve
+// so os digitos com DDI (5583999998888). Vazio e permitido (campo opcional).
+// Devolve null quando o numero e invalido.
+export function normalizePhone(value) {
+  let digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.length === 10 || digits.length === 11) digits = "55" + digits;
+  if (!/^55\d{10,11}$/.test(digits)) return null;
+  return digits;
+}
+
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -56,7 +67,13 @@ router.post("/", async (req, res, next) => {
       .trim()
       .replace(/\s+/g, " ");
     const force = Boolean(req.body.force);
+    const phone = normalizePhone(req.body.phone);
 
+    if (phone === null) {
+      return res.status(400).json({
+        error: "WhatsApp inválido. Use o DDD e o número, ex.: (83) 99999-8888.",
+      });
+    }
     if (!bookId) return res.status(400).json({ error: "Escolha um livro." });
     if (!personName)
       return res
@@ -100,8 +117,11 @@ router.post("/", async (req, res, next) => {
         });
       }
     } else {
-      person = await Person.create({ fullName: personName });
+      person = await Person.create({ fullName: personName, phone });
     }
+
+    // Guarda o ultimo WhatsApp informado para sugerir no proximo emprestimo.
+    if (phone && person.phone !== phone) person.phone = phone;
 
     const loan = await Loan.create({
       book: book._id,
@@ -112,6 +132,7 @@ router.post("/", async (req, res, next) => {
       bookTitleSort: normalizeText(book.title),
       personName,
       personNameSort: nameSort,
+      personPhone: phone,
       startDate: new Date(startDate),
       dueDate: dueDate ? new Date(dueDate) : null,
       notes: notes || "",
@@ -122,6 +143,25 @@ router.post("/", async (req, res, next) => {
     await person.save();
 
     return res.status(201).json(loan);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// PATCH /api/loans/:id/notified  { kind: "reminder" | "overdue" }
+// Registra que o administrador abriu o WhatsApp para avisar a pessoa.
+router.patch("/:id/notified", async (req, res, next) => {
+  try {
+    const field =
+      req.body.kind === "overdue" ? "overdueSentAt" : "reminderSentAt";
+    const loan = await Loan.findByIdAndUpdate(
+      req.params.id,
+      { [field]: new Date() },
+      { new: true },
+    );
+    if (!loan)
+      return res.status(404).json({ error: "Empréstimo não encontrado." });
+    return res.json(loan);
   } catch (error) {
     return next(error);
   }
