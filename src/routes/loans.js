@@ -91,10 +91,19 @@ router.post("/", async (req, res, next) => {
     const book = await Book.findById(bookId);
     if (!book) return res.status(404).json({ error: "Livro não encontrado." });
 
-    const bookIsOut = await Loan.findOne({ book: book._id, status: "ativo" });
-    if (bookIsOut) {
+    // Emprestimo so e permitido enquanto sobrar algum exemplar na estante.
+    const copies = book.copies || 1;
+    const bookLoans = await Loan.find({ book: book._id, status: "ativo" })
+      .select("personName")
+      .lean();
+    if (bookLoans.length >= copies) {
       return res.status(409).json({
-        error: "Esse livro ja está com " + bookIsOut.personName + ".",
+        error:
+          copies === 1
+            ? "Esse livro já está com " + bookLoans[0].personName + "."
+            : "Todas as " +
+              copies +
+              " unidades desse livro já estão emprestadas.",
       });
     }
 
@@ -177,7 +186,7 @@ router.patch("/:id/return", async (req, res, next) => {
     if (loan.status === "devolvido") {
       return res
         .status(409)
-        .json({ error: "Esse emprestimo ja foi devolvido." });
+        .json({ error: "Esse empréstimo já foi devolvido." });
     }
 
     loan.status = "devolvido";
@@ -195,7 +204,7 @@ router.delete("/:id", async (req, res, next) => {
   try {
     const loan = await Loan.findByIdAndDelete(req.params.id);
     if (!loan)
-      return res.status(404).json({ error: "Emprestimo não encontrado." });
+      return res.status(404).json({ error: "Empréstimo não encontrado." });
     return res.json({ ok: true });
   } catch (error) {
     return next(error);

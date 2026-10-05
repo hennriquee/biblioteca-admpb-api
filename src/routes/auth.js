@@ -14,19 +14,19 @@ router.post("/login", async (req, res, next) => {
     const password = String(req.body.password || "");
 
     if (!username || !password) {
-      return res.status(400).json({ error: "Informe usuario e senha." });
+      return res.status(400).json({ error: "Informe usuário e senha." });
     }
 
     const user = await User.findOne({ username });
 
     // Mensagem generica de proposito: nao revela se o erro foi no usuario ou na senha.
     if (!user) {
-      return res.status(401).json({ error: "Usuario ou senha invalidos." });
+      return res.status(401).json({ error: "Usuário ou senha inválidos." });
     }
 
     const passwordMatches = await user.checkPassword(password);
     if (!passwordMatches) {
-      return res.status(401).json({ error: "Usuario ou senha invalidos." });
+      return res.status(401).json({ error: "Usuário ou senha inválidos." });
     }
 
     const token = jwt.sign(

@@ -14,6 +14,70 @@ router.use(requireAuth);
 
 const DEFAULT_PAGE_SIZE = 10;
 const MAX_PAGE_SIZE = 50;
+const MAX_COPIES = 999;
+const COPIES_ERROR =
+  "A quantidade precisa ser um número inteiro de 1 a " +
+  MAX_COPIES +
+  ".";
+
+// Campos que o app pode gravar ao editar um livro. Qualquer outro campo
+// enviado na requisição é ignorado.
+const EDITABLE_FIELDS = [
+  "isbn",
+  "title",
+  "authors",
+  "publisher",
+  "year",
+  "pages",
+  "cover",
+  "synopsis",
+  "categories",
+  "copies",
+  "notes",
+];
+
+// Converte o valor recebido em número de exemplares. Vazio = 1 (padrão).
+// Devolve null quando o valor não é um inteiro válido.
+function parseCopies(value) {
+  if (value === undefined || value === null || value === "") return 1;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1 || number > MAX_COPIES) {
+    return null;
+  }
+  return number;
+}
+
+// Acrescenta a cada livro a situação dos exemplares:
+// - copies: total de exemplares
+// - loanedCount / loanedNames: quantos estão emprestados agora e com quem
+// - available: quantos estão na estante
+async function withLoanInfo(books) {
+  const activeLoans = await Loan.find({
+    status: "ativo",
+    book: { $in: books.map((book) => book._id) },
+  })
+    .select("book personName")
+    .sort({ startDate: 1 })
+    .lean();
+
+  const namesByBook = new Map();
+  activeLoans.forEach((loan) => {
+    const key = String(loan.book);
+    namesByBook.set(key, [...(namesByBook.get(key) || []), loan.personName]);
+  });
+
+  return books.map((book) => {
+    const loanedNames = namesByBook.get(String(book._id)) || [];
+    const copies = book.copies || 1;
+    return {
+      ...book,
+      copies,
+      loanedCount: loanedNames.length,
+      loanedNames,
+      available: Math.max(0, copies - loanedNames.length),
+    };
+  });
+}
 
 // GET /api/books?search=texto&page=1&limit=10
 // Lista os livros em ordem alfabetica, com filtro opcional de busca.
@@ -59,22 +123,9 @@ router.get("/", async (req, res, next) => {
     const books = await query.lean();
     const total = paginate ? await Book.countDocuments(filter) : books.length;
 
-    // Marca quais livros (dessa pagina) estao emprestados no momento.
-    const bookIds = books.map((book) => book._id);
-    const activeLoans = await Loan.find({
-      status: "ativo",
-      book: { $in: bookIds },
-    })
-      .select("book personName")
-      .lean();
-    const loanByBook = new Map(
-      activeLoans.map((loan) => [String(loan.book), loan.personName]),
-    );
-
-    const result = books.map((book) => ({
-      ...book,
-      loanedTo: loanByBook.get(String(book._id)) || null,
-    }));
+    // Marca, para cada livro (dessa pagina), quantos exemplares estao
+    // emprestados no momento e quantos estao disponiveis.
+    const result = await withLoanInfo(books);
 
     if (!paginate) {
       return res.json(result);
@@ -99,7 +150,7 @@ router.get("/lookup/:isbn", async (req, res, next) => {
     if (isbn.length !== 10 && isbn.length !== 13) {
       return res
         .status(400)
-        .json({ error: "O ISBN precisa ter 10 ou 13 digitos." });
+        .json({ error: "O ISBN precisa ter 10 ou 13 dígitos." });
     }
 
     const existing = await Book.findOne({ isbn });
@@ -108,11 +159,15 @@ router.get("/lookup/:isbn", async (req, res, next) => {
     if (!data) {
       return res.status(404).json({
         error:
-          "Nenhum livro encontrado para esse ISBN. Voce pode cadastrar manualmente.",
+          "Nenhum livro encontrado para esse ISBN. Você pode cadastrar manualmente.",
       });
     }
 
-    return res.json({ ...data, alreadyRegistered: Boolean(existing) });
+    return res.json({
+      ...data,
+      alreadyRegistered: Boolean(existing),
+      existingId: existing ? existing._id : null,
+    });
   } catch (error) {
     return next(error);
   }
@@ -141,7 +196,8 @@ router.get("/:id", async (req, res, next) => {
   try {
     const book = await Book.findById(req.params.id).lean();
     if (!book) return res.status(404).json({ error: "Livro não encontrado." });
-    return res.json(book);
+    const [withInfo] = await withLoanInfo([book]);
+    return res.json(withInfo);
   } catch (error) {
     return next(error);
   }
@@ -157,7 +213,12 @@ router.post("/", async (req, res, next) => {
     if (!title || !String(title).trim()) {
       return res
         .status(400)
-        .json({ error: "O titulo do livro e obrigatorio." });
+        .json({ error: "O título do livro é obrigatório." });
+    }
+
+    const copies = parseCopies(req.body.copies);
+    if (copies === null) {
+      return res.status(400).json({ error: COPIES_ERROR });
     }
 
     if (req.body.isbn) {
@@ -165,9 +226,10 @@ router.post("/", async (req, res, next) => {
         isbn: String(req.body.isbn).trim(),
       });
       if (duplicated) {
-        return res
-          .status(409)
-          .json({ error: "Ja existe um livro cadastrado com esse ISBN." });
+        return res.status(409).json({
+          error:
+            "Já existe um livro cadastrado com esse ISBN. Para ter mais unidades, edite o livro e aumente a quantidade.",
+        });
       }
     }
 
@@ -192,7 +254,7 @@ router.post("/", async (req, res, next) => {
       coverPublicId: uploaded ? uploaded.publicId : "",
       synopsis: req.body.synopsis || "",
       categories: req.body.categories || [],
-      copies: req.body.copies || 1,
+      copies,
       notes: req.body.notes || "",
     });
 
@@ -213,11 +275,12 @@ router.post("/", async (req, res, next) => {
 router.put("/:id", async (req, res, next) => {
   let uploaded = null;
   try {
-    const payload = { ...req.body };
-    delete payload._id;
-    delete payload.coverPublicId;
-    const coverImage = payload.coverImage;
-    delete payload.coverImage;
+    // So os campos permitidos entram (nada de _id, coverPublicId etc.).
+    const payload = {};
+    EDITABLE_FIELDS.forEach((field) => {
+      if (field in req.body) payload[field] = req.body[field];
+    });
+    const coverImage = req.body.coverImage;
 
     if (typeof payload.authors === "string") {
       payload.authors = payload.authors
@@ -232,6 +295,48 @@ router.put("/:id", async (req, res, next) => {
     const previous = await Book.findById(req.params.id).lean();
     if (!previous) {
       return res.status(404).json({ error: "Livro não encontrado." });
+    }
+
+    // Exemplares: inteiro de 1 a 999 e nunca menos do que os que estao
+    // emprestados agora (senao haveria mais emprestimos que exemplares).
+    if ("copies" in payload) {
+      const copies = parseCopies(payload.copies);
+      if (copies === null) {
+        return res.status(400).json({ error: COPIES_ERROR });
+      }
+      const loanedNow = await Loan.countDocuments({
+        book: previous._id,
+        status: "ativo",
+      });
+      if (copies < loanedNow) {
+        return res.status(409).json({
+          error:
+            loanedNow === 1
+              ? "Há 1 emprestado agora, então a quantidade não pode ser menor que 1."
+              : "Há " +
+                loanedNow +
+                " emprestados agora, então a quantidade não pode ser menor que " +
+                loanedNow +
+                ".",
+        });
+      }
+      payload.copies = copies;
+    }
+
+    // Mesmo ISBN de outro livro nao pode (o cadastro ja barra, a edicao tambem).
+    if (payload.isbn !== undefined) {
+      payload.isbn = String(payload.isbn || "").trim();
+      if (payload.isbn && payload.isbn !== previous.isbn) {
+        const duplicated = await Book.findOne({
+          isbn: payload.isbn,
+          _id: { $ne: previous._id },
+        });
+        if (duplicated) {
+          return res.status(409).json({
+            error: "Já existe outro livro cadastrado com esse ISBN.",
+          });
+        }
+      }
     }
 
     if (coverImage) {
@@ -289,16 +394,28 @@ router.put("/:id", async (req, res, next) => {
 // DELETE /api/books/:id
 router.delete("/:id", async (req, res, next) => {
   try {
-    const activeLoan = await Loan.findOne({
+    const activeLoans = await Loan.find({
       book: req.params.id,
       status: "ativo",
-    });
-    if (activeLoan) {
+    })
+      .select("personName")
+      .lean();
+    if (activeLoans.length === 1) {
       return res.status(409).json({
         error:
           "Esse livro está emprestado para " +
-          activeLoan.personName +
-          ". Confirme a devolucao antes de excluir.",
+          activeLoans[0].personName +
+          ". Confirme a devolução antes de excluir.",
+      });
+    }
+    if (activeLoans.length > 1) {
+      return res.status(409).json({
+        error:
+          "Esse livro tem " +
+          activeLoans.length +
+          " unidades emprestadas (" +
+          activeLoans.map((loan) => loan.personName).join(", ") +
+          "). Confirme as devoluções antes de excluir.",
       });
     }
 

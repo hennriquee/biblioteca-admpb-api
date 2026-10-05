@@ -62,7 +62,7 @@ export function assertValidCoverImage(dataUri) {
   const base64 = dataUri.slice(dataUri.indexOf(",") + 1);
   const approxBytes = Math.floor((base64.length * 3) / 4);
   if (approxBytes > MAX_BYTES) {
-    throw badRequest("A foto da capa e grande demais (maximo de 4 MB).");
+    throw badRequest("A foto da capa é grande demais (máximo de 4 MB).");
   }
 }
 
@@ -87,7 +87,7 @@ export async function uploadCover(dataUri) {
       (error && (error.message || error.error?.message)) || error,
     );
     const failure = new Error(
-      "Nao foi possivel enviar a foto da capa. Tente novamente em instantes.",
+      "Não foi possível enviar a foto da capa. Tente novamente em instantes.",
     );
     failure.status = 502;
     throw failure;

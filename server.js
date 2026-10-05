@@ -25,7 +25,7 @@ app.use(
       // Requisicoes sem origin (Postman, health check do Render) sao liberadas.
       if (!origin) return callback(null, true);
       if (allowedOrigins.includes(origin)) return callback(null, true);
-      return callback(new Error("Origem nao autorizada pelo CORS: " + origin));
+      return callback(new Error("Origem não autorizada pelo CORS: " + origin));
     },
   }),
 );
@@ -83,6 +83,6 @@ connectDatabase()
     });
   })
   .catch((error) => {
-    console.error("Nao foi possivel conectar ao MongoDB:", error.message);
+    console.error("Não foi possível conectar ao MongoDB:", error.message);
     process.exit(1);
   });

@@ -7,7 +7,7 @@ export function requireAuth(req, res, next) {
   const [scheme, token] = header.split(' ');
 
   if (scheme !== 'Bearer' || !token) {
-    return res.status(401).json({ error: 'Faca login para continuar.' });
+    return res.status(401).json({ error: 'Faça login para continuar.' });
   }
 
   try {
@@ -15,6 +15,6 @@ export function requireAuth(req, res, next) {
     req.user = { id: payload.sub, username: payload.username };
     return next();
   } catch (error) {
-    return res.status(401).json({ error: 'Sessao expirada. Faca login novamente.' });
+    return res.status(401).json({ error: 'Sessão expirada. Faça login novamente.' });
   }
 }
