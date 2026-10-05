@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { parsePhoneNumberFromString } from "libphonenumber-js";
 import Loan from "../models/Loan.js";
 import Book, { normalizeText } from "../models/Book.js";
 import Person from "../models/Person.js";
@@ -7,15 +8,15 @@ import { requireAuth } from "../middleware/auth.js";
 const router = Router();
 router.use(requireAuth);
 
-// Aceita "(83) 99999-8888", "83999998888" ou "+55 83 99999-8888" e devolve
-// so os digitos com DDI (5583999998888). Vazio e permitido (campo opcional).
-// Devolve null quando o numero e invalido.
+// Recebe so os digitos com DDI (ex.: 5534997885466), como o front envia, e
+// confere se e um numero real do pais indicado. Vazio e permitido (campo
+// opcional). Devolve null quando o numero e invalido.
 export function normalizePhone(value) {
-  let digits = String(value || "").replace(/\D/g, "");
+  const digits = String(value || "").replace(/\D/g, "");
   if (!digits) return "";
-  if (digits.length === 10 || digits.length === 11) digits = "55" + digits;
-  if (!/^55\d{10,11}$/.test(digits)) return null;
-  return digits;
+  const parsed = parsePhoneNumberFromString("+" + digits);
+  if (!parsed || !parsed.isValid()) return null;
+  return parsed.number.slice(1); // tira o "+": formato aceito pelo wa.me
 }
 
 function escapeRegex(value) {
@@ -71,7 +72,7 @@ router.post("/", async (req, res, next) => {
 
     if (phone === null) {
       return res.status(400).json({
-        error: "WhatsApp inválido. Use o DDD e o número, ex.: (83) 99999-8888.",
+        error: "WhatsApp inválido. Confira o país, o DDD e o número.",
       });
     }
     if (!bookId) return res.status(400).json({ error: "Escolha um livro." });
