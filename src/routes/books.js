@@ -3,6 +3,7 @@ import Book, { normalizeText } from "../models/Book.js";
 import Loan from "../models/Loan.js";
 import { requireAuth } from "../middleware/auth.js";
 import { lookupIsbn, searchCoverImages } from "../services/isbn.js";
+import { cleanCategoryList } from "../services/categories.js";
 import {
   assertValidCoverImage,
   deleteCover,
@@ -45,6 +46,16 @@ function parseCopies(value) {
     return null;
   }
   return number;
+}
+
+// Limpa as categorias recebidas e reaproveita a grafia que já existe no
+// acervo: "ficcao" e "Ficção" viram a mesma categoria, sem duplicar no filtro.
+async function prepareCategories(value) {
+  const list = cleanCategoryList(value);
+  if (!list.length) return [];
+  const existing = await Book.distinct("categories");
+  const byKey = new Map(existing.map((name) => [normalizeText(name), name]));
+  return list.map((name) => byKey.get(normalizeText(name)) || name);
 }
 
 // Acrescenta a cada livro a situação dos exemplares:
@@ -95,6 +106,10 @@ router.get("/", async (req, res, next) => {
     const search = normalizeText(req.query.search || "");
     const filter = {};
 
+    // Filtro por categoria (nome exato, como listado em /categories).
+    const category = String(req.query.category || "").trim();
+    if (category) filter.categories = category;
+
     if (search) {
       const regex = new RegExp(
         search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
@@ -138,6 +153,25 @@ router.get("/", async (req, res, next) => {
       limit,
       hasMore: page * limit < total,
     });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// GET /api/books/categories -> categorias já usadas no acervo, em ordem
+// alfabética, com quantos livros há em cada uma. Alimenta a lista do
+// cadastro e o filtro do acervo. (Fica antes de /:id para não ser confundida com um id.)
+router.get("/categories", async (req, res, next) => {
+  try {
+    const rows = await Book.aggregate([
+      { $unwind: "$categories" },
+      { $match: { categories: { $ne: "" } } },
+      { $group: { _id: "$categories", count: { $sum: 1 } } },
+    ]);
+    const categories = rows
+      .map((row) => ({ name: row._id, count: row.count }))
+      .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+    return res.json(categories);
   } catch (error) {
     return next(error);
   }
@@ -253,7 +287,7 @@ router.post("/", async (req, res, next) => {
       cover: uploaded ? uploaded.url : req.body.cover || "",
       coverPublicId: uploaded ? uploaded.publicId : "",
       synopsis: req.body.synopsis || "",
-      categories: req.body.categories || [],
+      categories: await prepareCategories(req.body.categories),
       copies,
       notes: req.body.notes || "",
     });
@@ -290,6 +324,9 @@ router.put("/:id", async (req, res, next) => {
     }
     if (payload.title) {
       payload.titleSort = normalizeText(payload.title);
+    }
+    if ("categories" in payload) {
+      payload.categories = await prepareCategories(payload.categories);
     }
 
     const previous = await Book.findById(req.params.id).lean();

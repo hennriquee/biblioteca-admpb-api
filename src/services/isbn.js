@@ -20,11 +20,17 @@
  * d) busca de imagens no DuckDuckGo; e) padrao de URL de capa da Amazon
  * (chute final).
  *
+ * A CATEGORIA vem da BrasilAPI ("subjects") e do Google Books ("categories"),
+ * convertidas para portugues e reduzidas ao nivel mais amplo (ver
+ * categories.js). A Open Library nao entra: seus "subject" sao etiquetas soltas.
+ *
  * O SerpAPI tem cota mensal limitada no plano gratis, por isso ele so e
  * chamado quando as fontes sem custo nao resolveram.
  *
  * O Node 20+ ja tem fetch nativo, entao nao precisamos instalar nada.
  */
+
+import { categoriesFromProvider } from "./categories.js";
 
 const TIMEOUT_MS = 8000;
 
@@ -260,7 +266,7 @@ async function fromBrasilApi(isbn) {
     pages: data.page_count || null,
     cover: data.cover_url || "",
     synopsis: data.synopsis || "",
-    categories: data.subjects || [],
+    categories: categoriesFromProvider(data.subjects),
     source: "BrasilAPI (" + (data.provider || "desconhecido") + ")",
   };
 }
@@ -269,7 +275,7 @@ async function fromOpenLibrary(isbn) {
   // search.json e o endpoint atual recomendado pela Open Library (o antigo
   // /api/books?bibkeys=... e mais instavel e vem apresentando erro 404).
   const fields =
-    "title,author_name,first_publish_year,publisher,number_of_pages_median,cover_i,subject,key";
+    "title,author_name,first_publish_year,publisher,number_of_pages_median,cover_i,key";
   const data = await fetchJson(
     "https://openlibrary.org/search.json?isbn=" + isbn + "&fields=" + fields,
   );
@@ -296,7 +302,9 @@ async function fromOpenLibrary(isbn) {
       ? "https://covers.openlibrary.org/b/id/" + doc.cover_i + "-L.jpg"
       : "",
     synopsis,
-    categories: (doc.subject || []).slice(0, 5),
+    // Os "subject" da Open Library sao etiquetas soltas (dezenas, em varios
+    // idiomas, sem ordem de importancia), entao nao viram categoria.
+    categories: [],
     source: "Open Library",
   };
 }
@@ -330,7 +338,7 @@ async function fromGoogleBooks(isbn) {
     pages: info.pageCount || null,
     cover,
     synopsis: info.description || "",
-    categories: info.categories || [],
+    categories: categoriesFromProvider(info.categories, { keepUnknown: false }),
     source: "Google Books",
   };
 }
@@ -613,6 +621,13 @@ export async function lookupIsbn(isbn) {
   // Books > Open Library. Cada merge so preenche o que a fonte anterior
   // deixou em branco, entao o resultado final soma o que cada uma tem.
   let result = merge(merge(brasilApi, google), openLibrary);
+
+  // Categoria: a do Google Books segue um padrao de mercado (Religion,
+  // Fiction...), enquanto a da CBL via BrasilAPI as vezes e generica ou
+  // imprecisa. Quando as duas existem, vale a do Google.
+  if (result && google && google.categories && google.categories.length) {
+    result.categories = google.categories;
+  }
 
   if (!result || !result.title) {
     // Nenhuma fonte estruturada achou o livro. Tenta adivinhar pelo menos o
