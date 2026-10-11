@@ -9,6 +9,7 @@ import bookRoutes from "./src/routes/books.js";
 import loanRoutes from "./src/routes/loans.js";
 import peopleRoutes from "./src/routes/people.js";
 import { requireAuth } from "./src/middleware/auth.js";
+import { backfillTitleOrder } from "./src/models/Book.js";
 
 const app = express();
 
@@ -77,7 +78,14 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 4000;
 
 connectDatabase()
-  .then(() => {
+  .then(async () => {
+    try {
+      const fixed = await backfillTitleOrder();
+      if (fixed) console.log("Ordem de título criada para " + fixed + " livro(s).");
+    } catch (error) {
+      // Não impede o servidor de subir: no máximo a ordem fica menos precisa.
+      console.error("Não foi possível preparar a ordem dos títulos:", error.message);
+    }
     app.listen(PORT, () => {
       console.log("API rodando na porta " + PORT);
     });

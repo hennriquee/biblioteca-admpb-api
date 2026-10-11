@@ -121,7 +121,7 @@ router.get("/", async (req, res, next) => {
     const paginate =
       req.query.page !== undefined || req.query.limit !== undefined;
 
-    const query = Book.find(filter).sort({ titleSort: 1 });
+    const query = Book.find(filter).sort({ titleOrder: 1, titleSort: 1 });
 
     let page = 1;
     let limit = 0;
