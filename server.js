@@ -8,6 +8,7 @@ import authRoutes from "./src/routes/auth.js";
 import bookRoutes from "./src/routes/books.js";
 import loanRoutes from "./src/routes/loans.js";
 import peopleRoutes from "./src/routes/people.js";
+import publicRoutes from "./src/routes/public.js";
 import { requireAuth } from "./src/middleware/auth.js";
 import { backfillTitleOrder } from "./src/models/Book.js";
 
@@ -48,6 +49,20 @@ const loginLimiter = rateLimit({
   },
 });
 
+// Consulta publica do acervo (pagina /catalogo): unica parte da API sem login.
+// So tem GET e so devolve dados do livro e contagens. Como qualquer pessoa
+// pode chamar, tem limite por IP (folgado, porque uma sala inteira na mesma
+// rede Wi-Fi aparece como um IP so).
+const publicLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 150,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Muitas consultas em pouco tempo. Aguarde um instante e tente de novo.",
+  },
+});
+
 app.get("/", (req, res) => {
   res.json({ name: "Biblioteca ADMP Brasil API", status: "online" });
 });
@@ -61,6 +76,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/books", bookRoutes);
 app.use("/api/loans", loanRoutes);
 app.use("/api/people", peopleRoutes);
+app.use("/api/public", publicLimiter, publicRoutes);
 
 // Rota nao encontrada
 app.use((req, res) => {
@@ -81,10 +97,14 @@ connectDatabase()
   .then(async () => {
     try {
       const fixed = await backfillTitleOrder();
-      if (fixed) console.log("Ordem de título criada para " + fixed + " livro(s).");
+      if (fixed)
+        console.log("Ordem de título criada para " + fixed + " livro(s).");
     } catch (error) {
       // Não impede o servidor de subir: no máximo a ordem fica menos precisa.
-      console.error("Não foi possível preparar a ordem dos títulos:", error.message);
+      console.error(
+        "Não foi possível preparar a ordem dos títulos:",
+        error.message,
+      );
     }
     app.listen(PORT, () => {
       console.log("API rodando na porta " + PORT);
