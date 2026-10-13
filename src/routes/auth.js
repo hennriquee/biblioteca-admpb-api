@@ -5,6 +5,18 @@ import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
 
+// O que o app precisa saber sobre quem entrou. O nome vem do registro de
+// Pessoa ligado a conta (ver models/User.js); conta antiga ainda sem pessoa
+// ligada aparece com o proprio nome de usuario.
+function toSession(user) {
+  return {
+    id: user._id,
+    username: user.username,
+    name: user.person?.fullName || user.username,
+    photo: user.photo || "",
+  };
+}
+
 // POST /api/auth/login  { username, password }
 router.post("/login", async (req, res, next) => {
   try {
@@ -17,7 +29,7 @@ router.post("/login", async (req, res, next) => {
       return res.status(400).json({ error: "Informe usuário e senha." });
     }
 
-    const user = await User.findOne({ username });
+    const user = await User.findOne({ username }).populate("person");
 
     // Mensagem generica de proposito: nao revela se o erro foi no usuario ou na senha.
     if (!user) {
@@ -35,10 +47,7 @@ router.post("/login", async (req, res, next) => {
       { expiresIn: process.env.JWT_EXPIRES_IN || "12h" },
     );
 
-    return res.json({
-      token,
-      user: { id: user._id, username: user.username, name: user.name },
-    });
+    return res.json({ token, user: toSession(user) });
   } catch (error) {
     return next(error);
   }
@@ -47,10 +56,12 @@ router.post("/login", async (req, res, next) => {
 // GET /api/auth/me  -> usado pelo front para saber se o token ainda vale
 router.get("/me", requireAuth, async (req, res, next) => {
   try {
-    const user = await User.findById(req.user.id).select("username name");
+    const user = await User.findById(req.user.id)
+      .select("username photo person")
+      .populate({ path: "person", select: "fullName" });
     if (!user)
       return res.status(401).json({ error: "Usuário não encontrado." });
-    return res.json({ user });
+    return res.json({ user: toSession(user) });
   } catch (error) {
     return next(error);
   }

@@ -9,8 +9,14 @@ import bookRoutes from "./src/routes/books.js";
 import loanRoutes from "./src/routes/loans.js";
 import peopleRoutes from "./src/routes/people.js";
 import publicRoutes from "./src/routes/public.js";
+import adminRoutes from "./src/routes/admins.js";
 import { requireAuth } from "./src/middleware/auth.js";
 import { backfillTitleOrder } from "./src/models/Book.js";
+import {
+  backfillAdminPersons,
+  backfillLoanPersonCodes,
+  backfillPersonCodes,
+} from "./src/services/people.js";
 
 const app = express();
 
@@ -36,6 +42,9 @@ app.use(
 // isso tem um limite maior. Vem antes do parser geral (1 MB) e so depois de
 // checar o login, para ninguem sem token conseguir mandar corpos grandes.
 app.use("/api/books", requireAuth, express.json({ limit: "6mb" }));
+// A rota de administradores aceita a foto de perfil (data URI), pelo mesmo
+// motivo e com o mesmo cuidado: limite maior, mas so depois de checar o login.
+app.use("/api/admins", requireAuth, express.json({ limit: "6mb" }));
 app.use(express.json({ limit: "1mb" }));
 
 // Protecao contra tentativa de adivinhar a senha: 20 tentativas a cada 15 min.
@@ -76,6 +85,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/books", bookRoutes);
 app.use("/api/loans", loanRoutes);
 app.use("/api/people", peopleRoutes);
+app.use("/api/admins", adminRoutes);
 app.use("/api/public", publicLimiter, publicRoutes);
 
 // Rota nao encontrada
@@ -99,6 +109,20 @@ connectDatabase()
       const fixed = await backfillTitleOrder();
       if (fixed)
         console.log("Ordem de título criada para " + fixed + " livro(s).");
+      // A ordem importa: numerar quem ja existia (do mais antigo para o mais
+      // novo) antes de criar a pessoa das contas antigas, que entra no fim.
+      const numbered = await backfillPersonCodes();
+      if (numbered) console.log(numbered + " pessoa(s) numerada(s).");
+      const linked = await backfillAdminPersons();
+      if (linked)
+        console.log(
+          linked + " conta(s) de administrador ligada(s) a uma pessoa.",
+        );
+      const loansNumbered = await backfillLoanPersonCodes();
+      if (loansNumbered)
+        console.log(
+          loansNumbered + " emprestimo(s) com o numero da pessoa preenchido.",
+        );
     } catch (error) {
       // Não impede o servidor de subir: no máximo a ordem fica menos precisa.
       console.error(

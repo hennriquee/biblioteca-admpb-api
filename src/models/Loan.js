@@ -13,6 +13,9 @@ const loanSchema = new mongoose.Schema(
     bookTitleSort: { type: String, index: true },
     personName: { type: String, required: true },
     personNameSort: { type: String, index: true },
+    // Numero visivel de quem pegou o livro (#3). Guardado junto, como o nome:
+    // e o que diferencia duas pessoas de nome igual na lista.
+    personCode: { type: Number, default: null },
     // WhatsApp (opcional): so digitos com DDI, ex. 5583999998888.
     // Vazio = sem WhatsApp cadastrado, e o botao de aviso nao aparece.
     personPhone: { type: String, default: '' },

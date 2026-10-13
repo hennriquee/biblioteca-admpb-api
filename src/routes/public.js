@@ -1,6 +1,7 @@
 import { Router } from "express";
 import Book, { normalizeText } from "../models/Book.js";
 import Loan from "../models/Loan.js";
+import User from "../models/User.js";
 import { MAX_CATEGORY_LENGTH } from "../services/categories.js";
 
 /**
@@ -135,6 +136,27 @@ function toPublicBook(book, loanedCount = 0) {
   };
 }
 
+// Equipe da biblioteca para o "Com quem falar?" do acervo publico.
+//
+// DAQUI SO SAI o que ajuda a encontrar a pessoa na igreja: os DOIS PRIMEIROS
+// NOMES e a foto. Telefone, nome de usuario e nome completo nao entram nesta
+// resposta - quem quer um livro procura a pessoa pessoalmente.
+async function libraryStaff() {
+  const users = await User.find()
+    .select("photo person")
+    .populate({ path: "person", select: "fullName" })
+    .lean();
+
+  return users
+    .filter((user) => user.person && user.person.fullName)
+    .map((user) => ({
+      id: String(user._id),
+      name: user.person.fullName.split(/\s+/).slice(0, 2).join(" "),
+      photo: user.photo || "",
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
+}
+
 // GET /api/public/overview
 // Totais do acervo e categorias (alimenta o filtro e o resumo da tela).
 //  - available: livros com pelo menos uma unidade na estante
@@ -142,7 +164,7 @@ function toPublicBook(book, loanedCount = 0) {
 router.get("/overview", async (req, res, next) => {
   try {
     const counts = await activeLoanCounts();
-    const [titles, outIds, categoryRows] = await Promise.all([
+    const [titles, outIds, categoryRows, staff] = await Promise.all([
       Book.countDocuments(),
       fullyLoanedIds(counts),
       Book.aggregate([
@@ -150,6 +172,7 @@ router.get("/overview", async (req, res, next) => {
         { $match: { categories: { $ne: "" } } },
         { $group: { _id: "$categories", count: { $sum: 1 } } },
       ]),
+      libraryStaff(),
     ]);
 
     const categories = categoryRows
@@ -162,6 +185,7 @@ router.get("/overview", async (req, res, next) => {
       available: titles - outIds.length,
       unavailable: outIds.length,
       categories,
+      staff,
     });
   } catch (error) {
     return next(error);

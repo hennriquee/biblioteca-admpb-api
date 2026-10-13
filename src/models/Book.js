@@ -26,8 +26,11 @@ const bookSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-export function normalizeText(value = '') {
-  return value
+// Aceita qualquer coisa e devolve texto: na query string, "?search[$ne]=x"
+// chega como objeto, e sem o String() aqui a rota quebraria com erro 500.
+// Virando texto, a busca simplesmente nao encontra nada.
+export function normalizeText(value) {
+  return String(value == null ? '' : value)
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()

@@ -5,10 +5,11 @@ import { requireAuth } from "../middleware/auth.js";
 import { lookupIsbn, searchCoverImages } from "../services/isbn.js";
 import { cleanCategoryList } from "../services/categories.js";
 import {
-  assertValidCoverImage,
-  deleteCover,
-  uploadCover,
-} from "../services/covers.js";
+  assertValidImage,
+  BOOK_COVER,
+  deleteImage,
+  uploadImage,
+} from "../services/images.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -281,8 +282,8 @@ router.post("/", async (req, res, next) => {
     }
 
     if (req.body.coverImage) {
-      assertValidCoverImage(req.body.coverImage);
-      uploaded = await uploadCover(req.body.coverImage);
+      assertValidImage(req.body.coverImage);
+      uploaded = await uploadImage(req.body.coverImage, BOOK_COVER);
     }
 
     const book = await Book.create({
@@ -308,7 +309,7 @@ router.post("/", async (req, res, next) => {
     return res.status(201).json(book);
   } catch (error) {
     // Se a foto subiu mas o livro nao foi salvo, nao deixa a foto orfa.
-    if (uploaded) await deleteCover(uploaded.publicId);
+    if (uploaded) await deleteImage(uploaded.publicId);
     return next(error);
   }
 });
@@ -390,8 +391,8 @@ router.put("/:id", async (req, res, next) => {
     }
 
     if (coverImage) {
-      assertValidCoverImage(coverImage);
-      uploaded = await uploadCover(coverImage);
+      assertValidImage(coverImage);
+      uploaded = await uploadImage(coverImage, BOOK_COVER);
       payload.cover = uploaded.url;
       payload.coverPublicId = uploaded.publicId;
     } else if ("cover" in payload && (payload.cover || "") !== previous.cover) {
@@ -405,7 +406,7 @@ router.put("/:id", async (req, res, next) => {
     });
 
     if (!book) {
-      if (uploaded) await deleteCover(uploaded.publicId);
+      if (uploaded) await deleteImage(uploaded.publicId);
       return res.status(404).json({ error: "Livro não encontrado." });
     }
 
@@ -427,7 +428,7 @@ router.put("/:id", async (req, res, next) => {
       previous.coverPublicId &&
       previous.coverPublicId !== book.coverPublicId
     ) {
-      await deleteCover(previous.coverPublicId);
+      await deleteImage(previous.coverPublicId);
       await Loan.updateMany(
         { book: book._id, status: { $ne: "ativo" } },
         { bookCover: book.cover },
@@ -436,7 +437,7 @@ router.put("/:id", async (req, res, next) => {
 
     return res.json(book);
   } catch (error) {
-    if (uploaded) await deleteCover(uploaded.publicId);
+    if (uploaded) await deleteImage(uploaded.publicId);
     return next(error);
   }
 });
@@ -475,7 +476,7 @@ router.delete("/:id", async (req, res, next) => {
     // Libera espaco no Cloudinary. Se falhar, o livro continua excluido (o
     // banco manda) e o erro fica registrado no log do servidor.
     const coverDeleted = book.coverPublicId
-      ? await deleteCover(book.coverPublicId)
+      ? await deleteImage(book.coverPublicId)
       : true;
 
     // Emprestimos ja devolvidos guardam uma copia do link da capa por alguns

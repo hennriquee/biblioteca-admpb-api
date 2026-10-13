@@ -1,23 +1,21 @@
 import { Router } from "express";
-import { parsePhoneNumberFromString } from "libphonenumber-js";
 import Loan from "../models/Loan.js";
 import Book, { normalizeText } from "../models/Book.js";
 import Person from "../models/Person.js";
 import { requireAuth } from "../middleware/auth.js";
+import { normalizePhone, PHONE_ERROR } from "../services/phone.js";
+import {
+  cleanPersonName,
+  createPerson,
+  describePerson,
+  findSimilarPeople,
+  isFullName,
+  syncActiveLoans,
+  withAdminFlag,
+} from "../services/people.js";
 
 const router = Router();
 router.use(requireAuth);
-
-// Recebe so os digitos com DDI (ex.: 5534997885466), como o front envia, e
-// confere se e um numero real do pais indicado. Vazio e permitido (campo
-// opcional). Devolve null quando o numero e invalido.
-export function normalizePhone(value) {
-  const digits = String(value || "").replace(/\D/g, "");
-  if (!digits) return "";
-  const parsed = parsePhoneNumberFromString("+" + digits);
-  if (!parsed || !parsed.isValid()) return null;
-  return parsed.number.slice(1); // tira o "+": formato aceito pelo wa.me
-}
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -42,7 +40,8 @@ router.get("/", async (req, res, next) => {
     }
 
     const loans = await Loan.find(filter).sort({ startDate: -1 }).lean();
-    return res.json(loans);
+    // Selo "admin" do lado do nome de quem pegou o livro.
+    return res.json(await withAdminFlag(loans));
   } catch (error) {
     return next(error);
   }
@@ -54,7 +53,7 @@ router.get("/:id", async (req, res, next) => {
     const loan = await Loan.findById(req.params.id).populate("book").lean();
     if (!loan)
       return res.status(404).json({ error: "Empréstimo não encontrado." });
-    return res.json(loan);
+    return res.json(await withAdminFlag(loan));
   } catch (error) {
     return next(error);
   }
@@ -64,26 +63,28 @@ router.get("/:id", async (req, res, next) => {
 router.post("/", async (req, res, next) => {
   try {
     const { bookId, startDate, dueDate, notes } = req.body;
-    const personName = String(req.body.personName || "")
-      .trim()
-      .replace(/\s+/g, " ");
+    const personName = cleanPersonName(req.body.personName);
     const force = Boolean(req.body.force);
     const phone = normalizePhone(req.body.phone);
 
     if (phone === null) {
-      return res.status(400).json({
-        error: "WhatsApp inválido. Confira o país, o DDD e o número.",
-      });
+      return res.status(400).json({ error: PHONE_ERROR });
     }
     if (!bookId) return res.status(400).json({ error: "Escolha um livro." });
-    if (!personName)
-      return res
-        .status(400)
-        .json({ error: "Informe o nome de quem está levando o livro." });
-    if (personName.split(" ").length < 2) {
-      return res
-        .status(400)
-        .json({ error: "Digite o nome completo (nome e sobrenome)." });
+    // Com a pessoa escolhida na lista (personId), o nome vale o que esta no
+    // cadastro dela - o texto digitado nem e olhado. A exigencia de nome e
+    // sobrenome e so para quem esta sendo cadastrado agora.
+    if (!req.body.personId) {
+      if (!personName) {
+        return res
+          .status(400)
+          .json({ error: "Informe o nome de quem está levando o livro." });
+      }
+      if (!isFullName(personName)) {
+        return res
+          .status(400)
+          .json({ error: "Digite o nome completo (nome e sobrenome)." });
+      }
     }
     if (!startDate)
       return res.status(400).json({ error: "Informe a data de retirada." });
@@ -107,31 +108,57 @@ router.post("/", async (req, res, next) => {
       });
     }
 
-    const nameSort = normalizeText(personName);
-    let person = await Person.findOne({ nameSort });
-
-    if (person) {
-      const openLoans = await Loan.find({ person: person._id, status: "ativo" })
-        .select("bookTitle")
-        .lean();
-      // O front pergunta "tem certeza?" e reenvia com force = true.
-      if (openLoans.length > 0 && !force) {
-        return res.status(409).json({
-          code: "PERSON_HAS_ACTIVE_LOAN",
-          error:
-            personName +
-            " já está com " +
-            openLoans.map((l) => l.bookTitle).join(", ") +
-            ".",
-          activeLoans: openLoans,
-        });
+    // QUEM esta levando o livro. O normal e o app mandar "personId" (a pessoa
+    // escolhida na lista de sugestoes): o cadastro da pessoa e a identidade,
+    // nao o nome. Sem personId, um nome igual ao de alguem que ja existe para
+    // a pergunta de quem e quem (ver models/Person.js).
+    let person = null;
+    if (req.body.personId) {
+      person = await Person.findById(req.body.personId);
+      if (!person) {
+        return res.status(404).json({ error: "Pessoa não encontrada." });
       }
     } else {
-      person = await Person.create({ fullName: personName, phone });
+      const { sameName } = await findSimilarPeople({ fullName: personName });
+      if (sameName.length && !req.body.newPerson) {
+        // Pode ser a mesma pessoa (o normal) ou uma homónima. O app
+        // pergunta e reenvia com personId ou com newPerson = true.
+        return res.status(409).json({
+          code: "PERSON_NAME_EXISTS",
+          error:
+            sameName.length === 1
+              ? describePerson(sameName[0]) +
+                " já está no cadastro. É a mesma pessoa?"
+              : "Há " +
+                sameName.length +
+                " pessoas cadastradas com esse nome. Escolha de quem se trata.",
+          people: sameName,
+        });
+      }
+      person = await createPerson({ fullName: personName, phone });
     }
 
-    // Guarda o ultimo WhatsApp informado para sugerir no proximo emprestimo.
-    if (phone && person.phone !== phone) person.phone = phone;
+    const openLoans = await Loan.find({ person: person._id, status: "ativo" })
+      .select("bookTitle")
+      .lean();
+    // O front pergunta "tem certeza?" e reenvia com force = true.
+    if (openLoans.length > 0 && !force) {
+      return res.status(409).json({
+        code: "PERSON_HAS_ACTIVE_LOAN",
+        error:
+          person.fullName +
+          " já está com " +
+          openLoans.map((l) => l.bookTitle).join(", ") +
+          ".",
+        activeLoans: openLoans,
+      });
+    }
+
+    // Trocou de numero: o cadastro da pessoa passa a valer com o novo, e os
+    // emprestimos que ela ja tem em andamento tambem (o aviso de devolucao
+    // precisa ir para o numero certo).
+    const phoneChanged = Boolean(phone) && person.phone !== phone;
+    if (phoneChanged) person.phone = phone;
 
     const loan = await Loan.create({
       book: book._id,
@@ -140,9 +167,10 @@ router.post("/", async (req, res, next) => {
       bookCover: book.cover,
       bookIsbn: book.isbn,
       bookTitleSort: normalizeText(book.title),
-      personName,
-      personNameSort: nameSort,
-      personPhone: phone,
+      personName: person.fullName,
+      personNameSort: normalizeText(person.fullName),
+      personCode: person.code || null,
+      personPhone: person.phone || "",
       startDate: new Date(startDate),
       dueDate: dueDate ? new Date(dueDate) : null,
       notes: notes || "",
@@ -151,6 +179,7 @@ router.post("/", async (req, res, next) => {
 
     person.loansCount += 1;
     await person.save();
+    if (phoneChanged) await syncActiveLoans(person);
 
     return res.status(201).json(loan);
   } catch (error) {
@@ -171,7 +200,7 @@ router.patch("/:id/notified", async (req, res, next) => {
     );
     if (!loan)
       return res.status(404).json({ error: "Empréstimo não encontrado." });
-    return res.json(loan);
+    return res.json(await withAdminFlag(loan.toObject()));
   } catch (error) {
     return next(error);
   }
@@ -193,7 +222,7 @@ router.patch("/:id/return", async (req, res, next) => {
     loan.returnedAt = new Date();
     await loan.save();
 
-    return res.json(loan);
+    return res.json(await withAdminFlag(loan.toObject()));
   } catch (error) {
     return next(error);
   }
