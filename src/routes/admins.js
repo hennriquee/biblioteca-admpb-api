@@ -17,17 +17,16 @@ import {
   cleanPersonName,
   findSimilarPeople,
   isFullName,
-  IS_ADMIN_FILTER,
   similarPeopleWarning,
   syncActiveLoans,
   syncApprovedByName,
 } from "../services/people.js";
 
 /**
- * Administradores (Configuracoes > Administradores).
+ * Minha conta (Configuracoes > Minha conta).
  *
- * O QUE UM ADMINISTRADOR PODE FAZER AQUI: ver a equipe e editar A PROPRIA
- * conta - nome, WhatsApp, foto, login e senha.
+ * O QUE UM ADMINISTRADOR PODE FAZER AQUI: ver e editar A PROPRIA conta -
+ * nome, WhatsApp, foto, login e senha. Nao ha lista dos outros.
  *
  * O QUE NAO PODE, DE PROPOSITO: criar administrador, desfazer administrador e
  * trocar a senha de outra pessoa. Quem mexe em quem entra no painel e so a
@@ -59,14 +58,18 @@ function toAdmin(person, currentUserId) {
   };
 }
 
-// GET /api/admins -> a equipe, so para ver (em ordem de numero).
-router.get("/", async (req, res, next) => {
+// GET /api/admins/me -> a PROPRIA conta (a tela "Minha conta"). Nao ha lista
+// dos outros administradores: quem quiser ve-los os encontra em /api/people,
+// com o selo "admin".
+router.get("/me", async (req, res, next) => {
   try {
-    const people = await Person.find(IS_ADMIN_FILTER)
+    const person = await Person.findById(req.user.id)
       .select("code fullName phone username photo")
-      .sort({ code: 1 })
       .lean();
-    return res.json(people.map((person) => toAdmin(person, req.user.id)));
+    if (!person || !person.username) {
+      return res.status(401).json({ error: "Sua conta não está mais ativa." });
+    }
+    return res.json(toAdmin(person, req.user.id));
   } catch (error) {
     return next(error);
   }
