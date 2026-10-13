@@ -14,7 +14,9 @@ const router = Router();
 router.use(requireAuth);
 
 const DEFAULT_PAGE_SIZE = 10;
-const MAX_PAGE_SIZE = 50;
+// O app baixa o acervo inteiro (ate 300 livros) num pedido so e filtra no
+// navegador; por isso o teto por pedido e 300.
+const MAX_PAGE_SIZE = 300;
 const MAX_COPIES = 999;
 const COPIES_ERROR =
   "A quantidade precisa ser um número inteiro de 1 a " +
@@ -121,7 +123,13 @@ router.get("/", async (req, res, next) => {
     const paginate =
       req.query.page !== undefined || req.query.limit !== undefined;
 
-    const query = Book.find(filter).sort({ titleOrder: 1, titleSort: 1 });
+    // O _id no fim desempata titulos iguais: sem ele, o mesmo livro poderia
+    // repetir (ou sumir) entre uma pagina e outra.
+    const query = Book.find(filter).sort({
+      titleOrder: 1,
+      titleSort: 1,
+      _id: 1,
+    });
 
     let page = 1;
     let limit = 0;
@@ -135,8 +143,13 @@ router.get("/", async (req, res, next) => {
       query.skip((page - 1) * limit).limit(limit);
     }
 
-    const books = await query.lean();
-    const total = paginate ? await Book.countDocuments(filter) : books.length;
+    // A lista e a contagem vao juntas ao banco (em fila, a resposta demora
+    // uma ida e volta a mais).
+    const [books, counted] = await Promise.all([
+      query.lean(),
+      paginate ? Book.countDocuments(filter) : null,
+    ]);
+    const total = paginate ? counted : books.length;
 
     // Marca, para cada livro (dessa pagina), quantos exemplares estao
     // emprestados no momento e quantos estao disponiveis.

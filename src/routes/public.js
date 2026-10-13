@@ -19,7 +19,9 @@ import { MAX_CATEGORY_LENGTH } from "../services/categories.js";
 const router = Router();
 
 const DEFAULT_PAGE_SIZE = 10;
-const MAX_PAGE_SIZE = 50;
+// O catalogo baixa o acervo inteiro (ate 300 livros) num pedido so e filtra
+// no navegador; por isso o teto por pedido e 300.
+const MAX_PAGE_SIZE = 300;
 const MAX_PAGE = 1000;
 const MAX_SEARCH_LENGTH = 80;
 
@@ -194,15 +196,20 @@ router.get("/books", async (req, res, next) => {
     const clause = searchClause(search);
     if (clause) Object.assign(filter, clause);
 
-    const counts = await activeLoanCounts();
-    if (status === "disponivel" || status === "emprestado") {
-      const outIds = await fullyLoanedIds(counts);
+    // So o filtro por situacao precisa da contagem de emprestimos ANTES de
+    // consultar os livros. Sem ele, as consultas vao juntas ao banco (cada
+    // ida e volta ao banco custa tempo; em fila, a resposta demora o triplo).
+    const filtersByStatus = status === "disponivel" || status === "emprestado";
+    const countsPromise = activeLoanCounts();
+    if (filtersByStatus) {
+      const outIds = await fullyLoanedIds(await countsPromise);
       filter._id = status === "emprestado" ? { $in: outIds } : { $nin: outIds };
     }
 
     // O _id no fim da ordenacao desempata titulos iguais: sem ele, o mesmo
     // livro poderia repetir (ou sumir) entre uma pagina e outra.
-    const [books, total] = await Promise.all([
+    const [counts, books, total] = await Promise.all([
+      countsPromise,
       Book.find(filter)
         .select(PUBLIC_BOOK_FIELDS)
         .sort({ titleOrder: 1, titleSort: 1, _id: 1 })
