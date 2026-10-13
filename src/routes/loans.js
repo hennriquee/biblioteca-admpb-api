@@ -2,7 +2,7 @@ import { Router } from "express";
 import Loan from "../models/Loan.js";
 import Book, { normalizeText } from "../models/Book.js";
 import Person from "../models/Person.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAdmin } from "../middleware/auth.js";
 import { normalizePhone, PHONE_ERROR } from "../services/phone.js";
 import {
   cleanPersonName,
@@ -15,7 +15,7 @@ import {
 } from "../services/people.js";
 
 const router = Router();
-router.use(requireAuth);
+router.use(requireAdmin);
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -88,6 +88,28 @@ router.post("/", async (req, res, next) => {
     }
     if (!startDate)
       return res.status(400).json({ error: "Informe a data de retirada." });
+
+    // As datas sao conferidas AQUI, nao so na tela: a tela e uma das formas de
+    // chamar a API, e um prazo antes da retirada faria a barra de progresso
+    // contar um tempo negativo.
+    const start = new Date(startDate);
+    if (Number.isNaN(start.getTime())) {
+      return res.status(400).json({ error: "A data de retirada não é válida." });
+    }
+    let due = null;
+    if (dueDate) {
+      due = new Date(dueDate);
+      if (Number.isNaN(due.getTime())) {
+        return res
+          .status(400)
+          .json({ error: "A data de devolução não é válida." });
+      }
+      if (due < start) {
+        return res.status(400).json({
+          error: "A data de devolução não pode ser anterior à da retirada.",
+        });
+      }
+    }
 
     const book = await Book.findById(bookId);
     if (!book) return res.status(404).json({ error: "Livro não encontrado." });
@@ -171,17 +193,34 @@ router.post("/", async (req, res, next) => {
       personNameSort: normalizeText(person.fullName),
       personCode: person.code || null,
       personPhone: person.phone || "",
-      startDate: new Date(startDate),
-      dueDate: dueDate ? new Date(dueDate) : null,
+      // QUEM APROVOU: o administrador que esta registrando o emprestimo. Sai
+      // da sessao (req.account), nunca do que o app mandou - ninguem assina
+      // um emprestimo no lugar de outra pessoa.
+      approvedBy: req.account._id,
+      approvedByName: req.account.fullName,
+      startDate: start,
+      dueDate: due,
       notes: notes || "",
       status: "ativo",
     });
 
-    person.loansCount += 1;
-    await person.save();
+    // Os dois contadores sobem com $inc, que soma no proprio banco: dois
+    // emprestimos ao mesmo tempo nao se atropelam, como aconteceria lendo o
+    // numero e gravando de volta. O numero novo de WhatsApp, quando ha, e
+    // gravado na mesma ida ao banco.
+    await Promise.all([
+      Person.updateOne(
+        { _id: person._id },
+        {
+          $inc: { loansCount: 1 },
+          ...(phoneChanged ? { $set: { phone: person.phone } } : {}),
+        },
+      ),
+      Book.updateOne({ _id: book._id }, { $inc: { loansTotal: 1 } }),
+    ]);
     if (phoneChanged) await syncActiveLoans(person);
 
-    return res.status(201).json(loan);
+    return res.status(201).json(await withAdminFlag(loan.toObject()));
   } catch (error) {
     return next(error);
   }
@@ -200,6 +239,29 @@ router.patch("/:id/notified", async (req, res, next) => {
     );
     if (!loan)
       return res.status(404).json({ error: "Empréstimo não encontrado." });
+    return res.json(await withAdminFlag(loan.toObject()));
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// PATCH /api/loans/:id/notes  { notes }
+// So pode anotar enquanto o emprestimo esta em andamento: depois de
+// devolvido, o registro fica congelado (ver /return).
+router.patch("/:id/notes", async (req, res, next) => {
+  try {
+    const loan = await Loan.findById(req.params.id);
+    if (!loan)
+      return res.status(404).json({ error: "Empréstimo não encontrado." });
+    if (loan.status === "devolvido") {
+      return res.status(409).json({
+        error: "Esse empréstimo já foi devolvido; a observação não pode mais ser alterada.",
+      });
+    }
+
+    loan.notes = String(req.body.notes || "");
+    await loan.save();
+
     return res.json(await withAdminFlag(loan.toObject()));
   } catch (error) {
     return next(error);
@@ -234,6 +296,19 @@ router.delete("/:id", async (req, res, next) => {
     const loan = await Loan.findByIdAndDelete(req.params.id);
     if (!loan)
       return res.status(404).json({ error: "Empréstimo não encontrado." });
+    // Registro apagado = emprestimo que nao aconteceu: os dois contadores
+    // voltam atras, os mesmos que o registro fez subir. O "$gt: 0" no filtro
+    // impede numero negativo.
+    await Promise.all([
+      Book.updateOne(
+        { _id: loan.book, loansTotal: { $gt: 0 } },
+        { $inc: { loansTotal: -1 } },
+      ),
+      Person.updateOne(
+        { _id: loan.person, loansCount: { $gt: 0 } },
+        { $inc: { loansCount: -1 } },
+      ),
+    ]);
     return res.json({ ok: true });
   } catch (error) {
     return next(error);

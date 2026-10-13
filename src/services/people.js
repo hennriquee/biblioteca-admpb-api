@@ -1,14 +1,18 @@
 /**
- * Regras de "quem e quem" compartilhadas pelas rotas de pessoas, contas de
- * administrador e emprestimos. Ver o comentario grande em models/Person.js.
+ * Regras de "quem e quem" compartilhadas pelas rotas de pessoas, de
+ * administradores e de emprestimos. Ver o comentario grande em
+ * models/Person.js.
  */
 import Person from "../models/Person.js";
-import User from "../models/User.js";
+import LegacyUser from "../models/User.js";
 import Loan from "../models/Loan.js";
 import Counter from "../models/Counter.js";
 import { normalizeText } from "../models/Book.js";
 
 export const MAX_NAME_LENGTH = 80;
+
+// Pessoa que entra no painel = pessoa com login. Usado nos filtros do Mongo.
+export const IS_ADMIN_FILTER = { username: { $type: "string" } };
 
 // Tira espacos sobrando. Nome de pessoa precisa de nome e sobrenome: com so
 // uma palavra, duas pessoas diferentes viram "a Maria" e ninguem se acha.
@@ -36,11 +40,22 @@ export async function nextPersonCode() {
 }
 
 // UNICO lugar que cria pessoa. Garante que toda pessoa nasca com numero.
-export async function createPerson({ fullName, phone = "" }) {
+// Nasce sempre SEM login: virar administrador e um segundo passo, feito so
+// pela tela de manutencao (routes/dev.js).
+export async function createPerson({
+  fullName,
+  phone = "",
+  photo = "",
+  photoPublicId = "",
+}) {
   return Person.create({
     code: await nextPersonCode(),
     fullName,
     phone: phone || "",
+    photo: photo || "",
+    photoPublicId: photoPublicId || "",
+    username: null,
+    passwordHash: null,
   });
 }
 
@@ -56,7 +71,11 @@ export async function findSimilarPeople({ fullName, phone, exceptId }) {
 
   const filter = { $or: or };
   if (exceptId) filter._id = { $ne: exceptId };
-  const found = await Person.find(filter).select("code fullName phone").lean();
+  // A foto vai junto: e ela que faz o app conseguir mostrar o rosto de cada
+  // candidata na pergunta "e a mesma pessoa?" (ver SamePersonDialog).
+  const found = await Person.find(filter)
+    .select("code fullName phone photo")
+    .lean();
 
   const nameKey = fullName ? normalizeText(fullName) : null;
   return {
@@ -83,9 +102,7 @@ export function similarPeopleWarning({ sameName, samePhone }, fullName) {
     return {
       code: "PERSON_NAME_EXISTS",
       error:
-        "Já existe " +
-        describePerson(other) +
-        " no cadastro. É a mesma pessoa?",
+        "Já existe " + describePerson(other) + " no cadastro. É a mesma pessoa?",
       people: sameName,
     };
   }
@@ -103,29 +120,19 @@ export function similarPeopleWarning({ sameName, samePhone }, fullName) {
   return null;
 }
 
-// Pessoas que tem conta de administrador: Map(id da pessoa -> conta). Sao
-// poucas, entao vem todas de uma vez e quem chamou so consulta o mapa (tem
-// .has() como um Set, e .get() para quem quer a foto ou o usuario).
-export async function adminPersonIds() {
-  const users = await User.find({ person: { $ne: null } })
-    .select("person username photo")
-    .lean();
-  return new Map(
-    users.map((user) => [
-      String(user.person),
-      { username: user.username, photo: user.photo || "" },
-    ]),
-  );
-}
-
 // Acrescenta a cada emprestimo se quem pegou o livro e administrador (o app
-// mostra um selo "admin" do lado do nome).
+// mostra um selo "admin" do lado do nome). Uma consulta so, com os ids que
+// aparecem na lista.
 export async function withAdminFlag(loans) {
   const list = Array.isArray(loans) ? loans : [loans];
-  const admins = await adminPersonIds();
+  const ids = [...new Set(list.map((loan) => String(loan.person)))];
+  const admins = await Person.find({ _id: { $in: ids }, ...IS_ADMIN_FILTER })
+    .select("_id")
+    .lean();
+  const adminIds = new Set(admins.map((person) => String(person._id)));
   const marked = list.map((loan) => ({
     ...loan,
-    personIsAdmin: admins.has(String(loan.person)),
+    personIsAdmin: adminIds.has(String(loan.person)),
   }));
   return Array.isArray(loans) ? marked : marked[0];
 }
@@ -141,6 +148,17 @@ export async function syncActiveLoans(person) {
       personNameSort: normalizeText(person.fullName),
       personPhone: person.phone || "",
     },
+  );
+}
+
+// O administrador que aprovou emprestimos mudou de nome: os registros dele
+// passam a mostrar o nome novo, inclusive no historico - e a mesma pessoa, so
+// escrita certo. (Diferente do nome de QUEM PEGOU o livro, que no historico
+// fica como estava na epoca: ali o nome e parte do registro do emprestimo.)
+export async function syncApprovedByName(person) {
+  await Loan.updateMany(
+    { approvedBy: person._id },
+    { approvedByName: person.fullName },
   );
 }
 
@@ -171,7 +189,10 @@ export async function backfillPersonCodes() {
   );
 
   for (const person of withoutCode) {
-    await Person.updateOne({ _id: person._id }, { code: await nextPersonCode() });
+    await Person.updateOne(
+      { _id: person._id },
+      { code: await nextPersonCode() },
+    );
   }
   return withoutCode.length;
 }
@@ -206,26 +227,88 @@ export async function backfillLoanPersonCodes() {
 }
 
 /**
- * Conta de administrador antiga (de antes de existir a tela de
- * administradores) nao tinha pessoa ligada: o nome ficava no proprio usuario.
- * Roda uma vez, no inicio do servidor, e liga cada conta a uma pessoa - a que
- * ja existir com aquele nome ou uma nova. Devolve quantas contas foram ligadas.
+ * MUDANCA DE CASA DAS CONTAS DE ADMINISTRADOR.
+ *
+ * Antes, a conta (login, senha e foto) vivia na colecao "users" e apontava
+ * para a Pessoa. Hoje login e senha sao dois campos da propria Pessoa, e e
+ * isso que permite transformar um usuario em administrador. Esta funcao roda
+ * ao iniciar o servidor e leva cada conta que ficou la para a ficha da pessoa.
+ *
+ * Roda uma vez por conta: a levada recebe "mergedAt" e nao e olhada de novo -
+ * senao, uma senha trocada depois voltaria para a antiga no proximo reinicio.
+ * A colecao antiga nao e apagada: fica como copia de seguranca.
+ *
+ * QUANDO NAO DA PARA LEVAR (a ficha ja tem outro login, o login ja e de
+ * outra pessoa, a conta nao aponta para ficha nenhuma): a conta NAO e
+ * marcada como levada. Ela recebe "skippedAt" com o motivo e o motivo vai
+ * para o log, para a conta nao sumir em silencio. O login dela deixa de
+ * existir, e quem resolve e a tela de manutencao, dando um login novo a
+ * pessoa certa - nunca este script adivinhando de quem era a conta.
+ *
+ * Devolve { moved, skipped: [{ username, reason }] }.
  */
-export async function backfillAdminPersons() {
-  const users = await User.find({
-    $or: [{ person: null }, { person: { $exists: false } }],
+export async function mergeLegacyAdminAccounts() {
+  const legacy = await LegacyUser.find({
+    mergedAt: null,
+    skippedAt: null,
+    username: { $type: "string" },
+    passwordHash: { $type: "string" },
   }).lean();
-  if (!users.length) return 0;
+  if (!legacy.length) return { moved: 0, skipped: [] };
 
-  let linked = 0;
-  for (const user of users) {
-    // "name" era o campo antigo da conta; hoje o nome vive na pessoa.
-    const fullName = cleanPersonName(user.name) || "Administrador";
-    const nameSort = normalizeText(fullName);
-    let person = await Person.findOne({ nameSort });
-    if (!person) person = await createPerson({ fullName });
-    await User.updateOne({ _id: user._id }, { person: person._id });
-    linked += 1;
+  // As mais antigas primeiro: se duas contas apontarem para a mesma pessoa
+  // (nao deveria acontecer), a primeira e a que vale.
+  legacy.sort((a, b) => String(a._id).localeCompare(String(b._id)));
+
+  let moved = 0;
+  const skipped = [];
+
+  for (const account of legacy) {
+    const person = account.person
+      ? await Person.findById(account.person)
+      : null;
+
+    // Sem ficha ligada, nao ha como saber de QUEM e a conta. Procurar pelo
+    // nome seria chute: duas pessoas podem ter o mesmo nome (ver o comentario
+    // em models/Person.js), e o chute entregaria login e senha de
+    // administrador para a pessoa errada.
+    let reason = "";
+    if (!person) {
+      reason = account.person
+        ? "a ficha de pessoa desta conta nao existe mais"
+        : "a conta nao aponta para nenhuma ficha de pessoa";
+    } else if (person.username) {
+      reason =
+        person.username === account.username
+          ? "a ficha ja tem este login"
+          : 'a ficha ja tem o login "' + person.username + '"';
+    } else if (
+      await Person.exists({
+        username: account.username,
+        _id: { $ne: person._id },
+      })
+    ) {
+      reason = "este login ja esta com outra pessoa";
+    }
+
+    if (reason) {
+      skipped.push({ username: account.username, reason });
+      await LegacyUser.updateOne(
+        { _id: account._id },
+        { skippedAt: new Date(), skipReason: reason },
+      );
+      continue;
+    }
+
+    person.username = account.username;
+    person.passwordHash = account.passwordHash;
+    if (account.photo) person.photo = account.photo;
+    if (account.photoPublicId) person.photoPublicId = account.photoPublicId;
+    await person.save();
+    moved += 1;
+
+    await LegacyUser.updateOne({ _id: account._id }, { mergedAt: new Date() });
   }
-  return linked;
+
+  return { moved, skipped };
 }

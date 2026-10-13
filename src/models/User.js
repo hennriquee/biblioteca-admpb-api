@@ -1,58 +1,43 @@
 import mongoose from 'mongoose';
-import bcrypt from 'bcryptjs';
 
 /**
- * Conta de administrador: quem entra no painel com usuario e senha.
+ * COLECAO ANTIGA ("users"), mantida so para a mudanca de casa.
  *
- * O NOME E O TELEFONE NAO FICAM AQUI. Eles ficam no registro de Pessoa
- * apontado por "person": o administrador tambem e alguem que pode pegar um
- * livro emprestado, e seria confusao ter o nome dele escrito em dois lugares
- * (um poderia ser editado e o outro nao). Por isso:
+ * Antes, a conta de administrador vivia aqui e apontava para a Pessoa dela.
+ * Hoje nao existe mais essa separacao: login e senha sao dois campos da
+ * propria Pessoa (ver models/Person.js), e e isso que permite transformar um
+ * usuario em administrador sem copiar nada de lugar nenhum.
  *
- * - editar o nome/telefone de um administrador edita a Pessoa dele;
- * - um emprestimo recebe o selo "admin" quando a pessoa que pegou o livro tem
- *   uma conta ligada a ela;
- * - excluir a conta de administrador NAO apaga a Pessoa: o historico de
- *   emprestimos dela continua de pe, so perde o acesso ao painel.
+ * Este modelo so e usado por mergeLegacyAdminAccounts() (services/people.js),
+ * que roda ao iniciar o servidor e leva as contas que ficaram aqui para a
+ * ficha da pessoa. Cada conta levada recebe "mergedAt", para a mudanca nao
+ * acontecer duas vezes e sobrescrever uma senha trocada depois. A conta que
+ * NAO pudesse ser levada recebe "skippedAt" e "skipReason" - e nao
+ * "mergedAt", que diria que ela foi - para o motivo ficar registrado aqui e
+ * no log do servidor, em vez de o login simplesmente desaparecer.
  *
- * A foto de perfil (redonda no app) fica no Cloudinary; "photoPublicId" e o
- * que permite apagar a antiga quando ela e trocada ou removida.
+ * A colecao e deixada no banco de proposito: e a copia de seguranca da
+ * mudanca. Nada no sistema le daqui para funcionar.
  */
 const userSchema = new mongoose.Schema(
   {
-    username: {
-      type: String,
-      required: true,
-      unique: true,
-      trim: true,
-      lowercase: true,
-    },
-    // Nunca guardamos a senha em texto puro, apenas o hash dela.
-    passwordHash: {
-      type: String,
-      required: true,
-    },
+    username: { type: String, trim: true, lowercase: true },
+    passwordHash: { type: String },
+    // Nome que as contas mais antigas guardavam nelas mesmas, antes de existir
+    // o registro de Pessoa.
+    name: { type: String },
     person: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Person',
       default: null,
-      index: true,
     },
     photo: { type: String, default: '' },
     photoPublicId: { type: String, default: '' },
+    mergedAt: { type: Date, default: null },
+    skippedAt: { type: Date, default: null },
+    skipReason: { type: String, default: '' },
   },
-  { timestamps: true }
+  { timestamps: true, strict: false }
 );
-
-// Gera o hash a partir da senha em texto puro.
-userSchema.statics.hashPassword = async function hashPassword(plainPassword) {
-  const saltRounds = 12;
-  return bcrypt.hash(plainPassword, saltRounds);
-};
-
-// Compara a senha digitada com o hash salvo no banco.
-userSchema.methods.checkPassword = function checkPassword(plainPassword) {
-  return bcrypt.compare(plainPassword, this.passwordHash);
-};
 
 export default mongoose.model('User', userSchema);

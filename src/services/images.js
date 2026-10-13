@@ -1,13 +1,13 @@
 /**
- * Fotos hospedadas no Cloudinary: capas de livro e fotos de perfil dos
- * administradores.
+ * Fotos hospedadas no Cloudinary: capas de livro e fotos de perfil das
+ * pessoas do cadastro.
  *
  * - uploadImage(dataUri, destino): recebe a foto ja recortada pelo front
  *   (data URI base64), envia para o Cloudinary e devolve { url, publicId }.
  * - deleteImage(publicId): apaga a foto la, para nao lotar o plano gratis.
  *
  * REGRA DA CASA: toda foto guardada aqui tem um publicId salvo no banco
- * (Book.coverPublicId, User.photoPublicId). Sempre que esse campo deixa de
+ * (Book.coverPublicId, Person.photoPublicId). Sempre que esse campo deixa de
  * apontar para a foto (troca, remocao ou exclusao do registro), quem fez a
  * mudanca chama deleteImage com o publicId ANTIGO. Se a gravacao no banco
  * falhar depois de um upload, a foto recem-enviada tambem e apagada: nenhuma
@@ -28,7 +28,10 @@ export const BOOK_COVER = {
   label: "a foto da capa",
 };
 
-export const ADMIN_PHOTO = {
+// Foto de perfil de QUALQUER pessoa do cadastro, nao so de administrador (a
+// pasta se chama "admins" porque nasceu assim; o nome dela no Cloudinary nao
+// pode mudar sem orfanar as fotos que ja estao la).
+export const PROFILE_PHOTO = {
   folder: "biblioteca-admpb/admins",
   // Foto de perfil: quadrada (o app mostra redonda, o front recorta 400x400).
   width: 600,
@@ -36,7 +39,7 @@ export const ADMIN_PHOTO = {
   label: "a foto de perfil",
 };
 
-const FOLDERS = [BOOK_COVER.folder, ADMIN_PHOTO.folder];
+const FOLDERS = [BOOK_COVER.folder, PROFILE_PHOTO.folder];
 
 // Limite do arquivo ja decodificado. O front manda ~150 KB (capa) ou ~60 KB
 // (perfil); 4 MB e folga de sobra e impede abuso.

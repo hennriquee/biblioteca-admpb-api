@@ -1,8 +1,12 @@
 import { Router } from "express";
-import Book, { normalizeText } from "../models/Book.js";
+import Book, {
+  mostLoanedBookId,
+  normalizeText,
+} from "../models/Book.js";
 import Loan from "../models/Loan.js";
-import User from "../models/User.js";
+import Person from "../models/Person.js";
 import { MAX_CATEGORY_LENGTH } from "../services/categories.js";
+import { IS_ADMIN_FILTER } from "../services/people.js";
 
 /**
  * Rotas PUBLICAS (sem login) do acervo. Alimentam a pagina /catalogo, que e
@@ -28,7 +32,7 @@ const MAX_SEARCH_LENGTH = 80;
 
 // Unicos campos do livro que o banco entrega para estas rotas.
 const PUBLIC_BOOK_FIELDS =
-  "isbn title authors publisher year pages cover synopsis categories copies";
+  "isbn title authors publisher year pages cover synopsis categories copies loansTotal";
 
 // Na query string, "?category[$ne]=x" chega como objeto. Se isso fosse direto
 // para o filtro do Mongo, viraria um operador. Aqui so texto simples passa.
@@ -133,6 +137,9 @@ function toPublicBook(book, loanedCount = 0) {
     copies,
     loaned,
     available: copies - loaned,
+    // Quantas vezes o livro ja saiu emprestado. E so um numero: nao diz quem
+    // pegou, nem quando.
+    loansTotal: book.loansTotal || 0,
   };
 }
 
@@ -142,17 +149,18 @@ function toPublicBook(book, loanedCount = 0) {
 // NOMES e a foto. Telefone, nome de usuario e nome completo nao entram nesta
 // resposta - quem quer um livro procura a pessoa pessoalmente.
 async function libraryStaff() {
-  const users = await User.find()
-    .select("photo person")
-    .populate({ path: "person", select: "fullName" })
+  // A equipe sao as pessoas do cadastro que tem login no painel (ver
+  // models/Person.js). Quem e so usuario da biblioteca nunca aparece aqui.
+  const admins = await Person.find(IS_ADMIN_FILTER)
+    .select("fullName photo")
     .lean();
 
-  return users
-    .filter((user) => user.person && user.person.fullName)
-    .map((user) => ({
-      id: String(user._id),
-      name: user.person.fullName.split(/\s+/).slice(0, 2).join(" "),
-      photo: user.photo || "",
+  return admins
+    .filter((person) => person.fullName)
+    .map((person) => ({
+      id: String(person._id),
+      name: person.fullName.split(/\s+/).slice(0, 2).join(" "),
+      photo: person.photo || "",
     }))
     .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
 }
@@ -164,16 +172,17 @@ async function libraryStaff() {
 router.get("/overview", async (req, res, next) => {
   try {
     const counts = await activeLoanCounts();
-    const [titles, outIds, categoryRows, staff] = await Promise.all([
-      Book.countDocuments(),
-      fullyLoanedIds(counts),
-      Book.aggregate([
-        { $unwind: "$categories" },
-        { $match: { categories: { $ne: "" } } },
-        { $group: { _id: "$categories", count: { $sum: 1 } } },
-      ]),
-      libraryStaff(),
-    ]);
+    const [titles, outIds, categoryRows, staff] =
+      await Promise.all([
+        Book.countDocuments(),
+        fullyLoanedIds(counts),
+        Book.aggregate([
+          { $unwind: "$categories" },
+          { $match: { categories: { $ne: "" } } },
+          { $group: { _id: "$categories", count: { $sum: 1 } } },
+        ]),
+        libraryStaff(),
+      ]);
 
     const categories = categoryRows
       .map((row) => ({ name: row._id, count: row.count }))
@@ -232,7 +241,7 @@ router.get("/books", async (req, res, next) => {
 
     // O _id no fim da ordenacao desempata titulos iguais: sem ele, o mesmo
     // livro poderia repetir (ou sumir) entre uma pagina e outra.
-    const [counts, books, total] = await Promise.all([
+    const [counts, books, total, mostLoanedId] = await Promise.all([
       countsPromise,
       Book.find(filter)
         .select(PUBLIC_BOOK_FIELDS)
@@ -241,6 +250,7 @@ router.get("/books", async (req, res, next) => {
         .limit(limit)
         .lean(),
       Book.countDocuments(filter),
+      mostLoanedBookId(),
     ]);
 
     res.set("Cache-Control", "no-cache");
@@ -252,6 +262,10 @@ router.get("/books", async (req, res, next) => {
       page,
       limit,
       hasMore: page * limit < total,
+      // Qual livro do ACERVO leva a coroinha de mais emprestado (null quando
+      // ha empate no primeiro lugar). A tela so desenha a coroa se ele
+      // estiver na lista que esta aparecendo.
+      mostLoanedId,
     });
   } catch (error) {
     return next(error);

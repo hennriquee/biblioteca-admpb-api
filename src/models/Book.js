@@ -21,6 +21,12 @@ const bookSchema = new mongoose.Schema(
     synopsis: { type: String, default: '' },
     categories: { type: [String], default: [] },
     copies: { type: Number, default: 1, min: 1 },
+    // Quantas vezes o livro ja saiu emprestado, desde sempre. E um contador
+    // proprio porque o emprestimo devolvido some do banco depois de alguns
+    // dias (ver o TTL em models/Loan.js): contar os emprestimos existentes
+    // daria um numero que diminui com o tempo. Sobe quando um emprestimo e
+    // registrado e desce se o registro for apagado por engano.
+    loansTotal: { type: Number, default: 0, index: true },
     notes: { type: String, default: '' },
   },
   { timestamps: true }
@@ -100,6 +106,58 @@ export async function backfillTitleOrder() {
     }))
   );
   return missing.length;
+}
+
+/**
+ * O livro mais emprestado do acervo - o que ganha a coroinha no card.
+ *
+ * SO HA CAMPEAO QUANDO ELE ESTA SOZINHO NA FRENTE: com empate no primeiro
+ * lugar devolve null e ninguem recebe a coroa (coroar dois seria dizer que
+ * cada um e "o mais emprestado"). Acervo sem nenhum emprestimo tambem da null.
+ *
+ * Olha o acervo INTEIRO, nao a pagina que esta na tela: a coroa pertence ao
+ * mesmo livro em qualquer busca ou filtro - ela so nao aparece quando esse
+ * livro nao esta entre os que a tela mostra.
+ */
+export async function mostLoanedBookId() {
+  const top = await Book.find({ loansTotal: { $gt: 0 } })
+    .sort({ loansTotal: -1 })
+    .limit(2)
+    .select('loansTotal')
+    .lean();
+  if (!top.length) return null;
+  if (top.length > 1 && top[1].loansTotal === top[0].loansTotal) return null;
+  return String(top[0]._id);
+}
+
+/**
+ * Preenche o contador de emprestimos dos livros cadastrados antes de ele
+ * existir. Roda uma vez por livro (o filtro pega so quem ainda nao tem o
+ * campo), no inicio do servidor.
+ *
+ * O numero sai dos emprestimos que estao no banco agora. Os que foram
+ * devolvidos e ja sairam do sistema (ver o TTL em models/Loan.js) nao entram
+ * na conta - nao ha de onde tira-los. Dai para frente o contador e exato.
+ */
+export async function backfillBookLoanTotals() {
+  const pending = await Book.find({ loansTotal: { $exists: false } })
+    .select('_id')
+    .lean();
+  if (!pending.length) return 0;
+
+  const rows = await mongoose.model('Loan').aggregate([
+    { $match: { book: { $in: pending.map((book) => book._id) } } },
+    { $group: { _id: '$book', count: { $sum: 1 } } },
+  ]);
+  const countByBook = new Map(rows.map((row) => [String(row._id), row.count]));
+
+  for (const book of pending) {
+    await Book.updateOne(
+      { _id: book._id },
+      { loansTotal: countByBook.get(String(book._id)) || 0 }
+    );
+  }
+  return pending.length;
 }
 
 export default Book;

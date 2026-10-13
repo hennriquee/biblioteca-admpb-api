@@ -10,12 +10,18 @@ import loanRoutes from "./src/routes/loans.js";
 import peopleRoutes from "./src/routes/people.js";
 import publicRoutes from "./src/routes/public.js";
 import adminRoutes from "./src/routes/admins.js";
-import { requireAuth } from "./src/middleware/auth.js";
-import { backfillTitleOrder } from "./src/models/Book.js";
+import devRoutes from "./src/routes/dev.js";
+import { requireAdmin } from "./src/middleware/auth.js";
+import { isAccountUsernameShape } from "./src/services/credentials.js";
+import { devUsername, usingDefaultDevLogin } from "./src/services/devAccess.js";
 import {
-  backfillAdminPersons,
+  backfillBookLoanTotals,
+  backfillTitleOrder,
+} from "./src/models/Book.js";
+import {
   backfillLoanPersonCodes,
   backfillPersonCodes,
+  mergeLegacyAdminAccounts,
 } from "./src/services/people.js";
 
 const app = express();
@@ -41,10 +47,11 @@ app.use(
 // A rota de livros aceita a foto da capa (data URI ~150 KB, ate 4 MB), por
 // isso tem um limite maior. Vem antes do parser geral (1 MB) e so depois de
 // checar o login, para ninguem sem token conseguir mandar corpos grandes.
-app.use("/api/books", requireAuth, express.json({ limit: "6mb" }));
-// A rota de administradores aceita a foto de perfil (data URI), pelo mesmo
-// motivo e com o mesmo cuidado: limite maior, mas so depois de checar o login.
-app.use("/api/admins", requireAuth, express.json({ limit: "6mb" }));
+app.use("/api/books", requireAdmin, express.json({ limit: "6mb" }));
+// As rotas de gente aceitam a foto de perfil (data URI), pelo mesmo motivo e
+// com o mesmo cuidado: limite maior, mas so depois de checar o login.
+app.use("/api/admins", requireAdmin, express.json({ limit: "6mb" }));
+app.use("/api/people", requireAdmin, express.json({ limit: "6mb" }));
 app.use(express.json({ limit: "1mb" }));
 
 // Protecao contra tentativa de adivinhar a senha: 20 tentativas a cada 15 min.
@@ -86,6 +93,9 @@ app.use("/api/books", bookRoutes);
 app.use("/api/loans", loanRoutes);
 app.use("/api/people", peopleRoutes);
 app.use("/api/admins", adminRoutes);
+// Tela de manutencao: login e senha de quem entra no painel. So a sessao do
+// login reservado passa daqui (ver src/services/devAccess.js).
+app.use("/api/dev", devRoutes);
 app.use("/api/public", publicLimiter, publicRoutes);
 
 // Rota nao encontrada
@@ -95,41 +105,122 @@ app.use((req, res) => {
 
 // Tratador de erros central
 app.use((err, req, res, next) => {
+  // Id malformado no endereco (ex.: /api/people/abc): e pedido errado, nao
+  // falha do servidor. A mensagem do Mongoose fala de modelo e caminho
+  // interno do banco, que nao interessam a quem chamou.
+  if (err && err.name === "CastError") {
+    console.error("Id inválido em " + req.originalUrl);
+    return res
+      .status(400)
+      .json({ error: "Esse registro não existe (endereço inválido)." });
+  }
   console.error(err);
-  res
+  return res
     .status(err.status || 500)
     .json({ error: err.message || "Erro interno no servidor." });
 });
 
 const PORT = process.env.PORT || 4000;
 
+// Avisos de configuracao, no inicio do log: o login da tela de manutencao
+// (ver src/services/devAccess.js) e o unico caminho para dar e tirar acesso ao
+// painel, e os valores padrao estao escritos no codigo.
+function warnAboutDevLogin() {
+  if (usingDefaultDevLogin()) {
+    console.warn(
+      "ATENÇÃO: a tela de manutenção está com o login padrão, que está escrito no código. " +
+        "Defina DEV_USERNAME e DEV_PASSWORD no ambiente (no Render: Environment).",
+    );
+  }
+  if (isAccountUsernameShape(devUsername())) {
+    console.warn(
+      'ATENÇÃO: DEV_USERNAME ("' +
+        devUsername() +
+        '") tem a forma de um login de conta. Ele é conferido antes do banco, ' +
+        "então um administrador com esse mesmo login não conseguiria entrar. " +
+        "Use algo que o cadastro não aceite, como /usuariomaster.",
+    );
+  }
+}
+
+/**
+ * Preparos de banco ao iniciar. Cada um no seu try: a MUDANCA DE CASA DAS
+ * CONTAS nao pode ficar de fora porque um acerto de ordenacao falhou antes
+ * dela - sem ela, ninguem consegue entrar no painel.
+ */
+async function prepareDatabase() {
+  const steps = [
+    {
+      what: "a ordem dos títulos",
+      async run() {
+        const fixed = await backfillTitleOrder();
+        if (fixed) console.log("Ordem de título criada para " + fixed + " livro(s).");
+      },
+    },
+    {
+      what: "o contador de empréstimos dos livros",
+      async run() {
+        const counted = await backfillBookLoanTotals();
+        if (counted)
+          console.log(
+            "Contador de empréstimos preenchido em " + counted + " livro(s).",
+          );
+      },
+    },
+    {
+      // Antes da mudanca de casa das contas: numera quem ja existia, do mais
+      // antigo para o mais novo.
+      what: "o número das pessoas",
+      async run() {
+        const numbered = await backfillPersonCodes();
+        if (numbered) console.log(numbered + " pessoa(s) numerada(s).");
+      },
+    },
+    {
+      what: "as contas de administrador",
+      async run() {
+        const { moved, skipped } = await mergeLegacyAdminAccounts();
+        if (moved)
+          console.log(
+            moved + " conta(s) de administrador movida(s) para a ficha da pessoa.",
+          );
+        skipped.forEach((account) => {
+          console.warn(
+            'ATENÇÃO: o login "' +
+              account.username +
+              '" não foi movido (' +
+              account.reason +
+              "). Quem precisar desse acesso recebe um login novo na tela de manutenção.",
+          );
+        });
+      },
+    },
+    {
+      what: "o número da pessoa nos empréstimos",
+      async run() {
+        const loansNumbered = await backfillLoanPersonCodes();
+        if (loansNumbered)
+          console.log(
+            loansNumbered + " emprestimo(s) com o numero da pessoa preenchido.",
+          );
+      },
+    },
+  ];
+
+  for (const step of steps) {
+    try {
+      await step.run();
+    } catch (error) {
+      // Um passo que falha nao impede os outros nem o servidor de subir.
+      console.error("Não foi possível preparar " + step.what + ":", error.message);
+    }
+  }
+}
+
 connectDatabase()
   .then(async () => {
-    try {
-      const fixed = await backfillTitleOrder();
-      if (fixed)
-        console.log("Ordem de título criada para " + fixed + " livro(s).");
-      // A ordem importa: numerar quem ja existia (do mais antigo para o mais
-      // novo) antes de criar a pessoa das contas antigas, que entra no fim.
-      const numbered = await backfillPersonCodes();
-      if (numbered) console.log(numbered + " pessoa(s) numerada(s).");
-      const linked = await backfillAdminPersons();
-      if (linked)
-        console.log(
-          linked + " conta(s) de administrador ligada(s) a uma pessoa.",
-        );
-      const loansNumbered = await backfillLoanPersonCodes();
-      if (loansNumbered)
-        console.log(
-          loansNumbered + " emprestimo(s) com o numero da pessoa preenchido.",
-        );
-    } catch (error) {
-      // Não impede o servidor de subir: no máximo a ordem fica menos precisa.
-      console.error(
-        "Não foi possível preparar a ordem dos títulos:",
-        error.message,
-      );
-    }
+    warnAboutDevLogin();
+    await prepareDatabase();
     app.listen(PORT, () => {
       console.log("API rodando na porta " + PORT);
     });

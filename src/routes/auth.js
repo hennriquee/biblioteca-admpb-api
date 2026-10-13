@@ -1,53 +1,88 @@
 import { Router } from "express";
 import jwt from "jsonwebtoken";
-import User from "../models/User.js";
+import Person from "../models/Person.js";
 import { requireAuth } from "../middleware/auth.js";
+import { cleanUsername } from "../services/credentials.js";
+import { devUsername, isDevLogin } from "../services/devAccess.js";
 
 const router = Router();
 
-// O que o app precisa saber sobre quem entrou. O nome vem do registro de
-// Pessoa ligado a conta (ver models/User.js); conta antiga ainda sem pessoa
-// ligada aparece com o proprio nome de usuario.
-function toSession(user) {
+/**
+ * Entrada no painel. Sao duas sessoes possiveis (ver middleware/auth.js):
+ *
+ * - a de ADMINISTRADOR, de quem tem login e senha na propria ficha de pessoa;
+ * - a de MANUTENCAO, do login reservado (ver services/devAccess.js), que so
+ *   abre a tela de login e senha dos outros.
+ */
+
+// O que o app precisa saber sobre quem entrou.
+function toSession(person) {
   return {
-    id: user._id,
-    username: user.username,
-    name: user.person?.fullName || user.username,
-    photo: user.photo || "",
+    id: person._id,
+    username: person.username,
+    name: person.fullName,
+    photo: person.photo || "",
+    role: "admin",
   };
+}
+
+// A sessao de manutencao nao e ninguem no cadastro: nao tem ficha, nem foto,
+// nem historico. E so a chave que abre a tela de manutencao.
+function devSession() {
+  return {
+    id: "dev",
+    username: devUsername(),
+    name: "Manutenção",
+    photo: "",
+    role: "dev",
+  };
+}
+
+function signToken(session) {
+  return jwt.sign(
+    {
+      sub: String(session.id),
+      username: session.username,
+      role: session.role,
+    },
+    process.env.JWT_SECRET,
+    { expiresIn: process.env.JWT_EXPIRES_IN || "12h" },
+  );
 }
 
 // POST /api/auth/login  { username, password }
 router.post("/login", async (req, res, next) => {
   try {
-    const username = String(req.body.username || "")
-      .trim()
-      .toLowerCase();
+    const username = cleanUsername(req.body.username);
     const password = String(req.body.password || "");
 
     if (!username || !password) {
       return res.status(400).json({ error: "Informe usuário e senha." });
     }
 
-    const user = await User.findOne({ username }).populate("person");
+    // O login reservado e checado ANTES do banco: ele nao e uma conta de
+    // ninguem e nao pode esbarrar em nenhuma.
+    if (isDevLogin(username, password)) {
+      const session = devSession();
+      return res.json({ token: signToken(session), user: session });
+    }
+
+    // So quem tem login entra: quem e apenas usuario da biblioteca tem
+    // username null, e null nunca e igual ao texto digitado.
+    const person = await Person.findOne({ username });
 
     // Mensagem generica de proposito: nao revela se o erro foi no usuario ou na senha.
-    if (!user) {
+    if (!person) {
       return res.status(401).json({ error: "Usuário ou senha inválidos." });
     }
 
-    const passwordMatches = await user.checkPassword(password);
+    const passwordMatches = await person.checkPassword(password);
     if (!passwordMatches) {
       return res.status(401).json({ error: "Usuário ou senha inválidos." });
     }
 
-    const token = jwt.sign(
-      { sub: user._id.toString(), username: user.username },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "12h" },
-    );
-
-    return res.json({ token, user: toSession(user) });
+    const session = toSession(person);
+    return res.json({ token: signToken(session), user: session });
   } catch (error) {
     return next(error);
   }
@@ -56,12 +91,21 @@ router.post("/login", async (req, res, next) => {
 // GET /api/auth/me  -> usado pelo front para saber se o token ainda vale
 router.get("/me", requireAuth, async (req, res, next) => {
   try {
-    const user = await User.findById(req.user.id)
-      .select("username photo person")
-      .populate({ path: "person", select: "fullName" });
-    if (!user)
-      return res.status(401).json({ error: "Usuário não encontrado." });
-    return res.json({ user: toSession(user) });
+    if (req.user.role === "dev") {
+      return res.json({ user: devSession() });
+    }
+
+    const person = await Person.findById(req.user.id).select(
+      "username fullName photo",
+    );
+    // Conta que deixou de ser administradora (ou saiu do cadastro) nao volta
+    // para o painel, mesmo com o token ainda no prazo.
+    if (!person || !person.username) {
+      return res
+        .status(401)
+        .json({ error: "Esta conta não tem mais acesso ao painel." });
+    }
+    return res.json({ user: toSession(person) });
   } catch (error) {
     return next(error);
   }

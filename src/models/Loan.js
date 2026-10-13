@@ -23,6 +23,17 @@ const loanSchema = new mongoose.Schema(
     reminderSentAt: { type: Date, default: null },
     overdueSentAt: { type: Date, default: null },
 
+    // QUEM APROVOU: o administrador que registrou o emprestimo. Guarda o
+    // nome junto (como faz com o do livro e com o de quem pegou) para o
+    // historico continuar legivel mesmo que a pessoa deixe de ser
+    // administradora, troque de nome ou saia do cadastro.
+    approvedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Person',
+      default: null,
+    },
+    approvedByName: { type: String, default: '' },
+
     startDate: { type: Date, required: true },
     dueDate: { type: Date, default: null },
     // TTL index: o MongoDB apaga o documento sozinho 5 dias depois do valor

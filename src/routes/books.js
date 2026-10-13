@@ -1,7 +1,10 @@
 import { Router } from "express";
-import Book, { normalizeText } from "../models/Book.js";
+import Book, {
+  mostLoanedBookId,
+  normalizeText,
+} from "../models/Book.js";
 import Loan from "../models/Loan.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAdmin } from "../middleware/auth.js";
 import { lookupIsbn, searchCoverImages } from "../services/isbn.js";
 import { cleanCategoryList } from "../services/categories.js";
 import {
@@ -12,7 +15,7 @@ import {
 } from "../services/images.js";
 
 const router = Router();
-router.use(requireAuth);
+router.use(requireAdmin);
 
 const DEFAULT_PAGE_SIZE = 10;
 // O app baixa o acervo inteiro (ate 300 livros) num pedido so e filtra no
@@ -146,9 +149,10 @@ router.get("/", async (req, res, next) => {
 
     // A lista e a contagem vao juntas ao banco (em fila, a resposta demora
     // uma ida e volta a mais).
-    const [books, counted] = await Promise.all([
+    const [books, counted, mostLoanedId] = await Promise.all([
       query.lean(),
       paginate ? Book.countDocuments(filter) : null,
+      paginate ? mostLoanedBookId() : null,
     ]);
     const total = paginate ? counted : books.length;
 
@@ -166,6 +170,9 @@ router.get("/", async (req, res, next) => {
       page,
       limit,
       hasMore: page * limit < total,
+      // Qual livro do ACERVO leva a coroinha (null quando ha empate no
+      // primeiro lugar). A tela so desenha a coroa se ele estiver na lista.
+      mostLoanedId,
     });
   } catch (error) {
     return next(error);

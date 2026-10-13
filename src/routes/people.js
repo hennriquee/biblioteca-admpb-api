@@ -2,30 +2,65 @@ import { Router } from "express";
 import Person from "../models/Person.js";
 import Loan from "../models/Loan.js";
 import { normalizeText } from "../models/Book.js";
-import { requireAuth } from "../middleware/auth.js";
+import { requireAdmin } from "../middleware/auth.js";
 import { normalizePhone, PHONE_ERROR } from "../services/phone.js";
 import {
-  adminPersonIds,
+  assertValidImage,
+  deleteImage,
+  PROFILE_PHOTO,
+  uploadImage,
+} from "../services/images.js";
+import {
   cleanPersonName,
   createPerson,
   findSimilarPeople,
   isFullName,
   similarPeopleWarning,
   syncActiveLoans,
+  syncApprovedByName,
 } from "../services/people.js";
 
+/**
+ * Pessoas do cadastro (tela "Usuarios").
+ *
+ * Toda pessoa tem os MESMOS campos de um administrador - numero, nome,
+ * WhatsApp, foto - porque administrador e so uma pessoa que tambem tem login e
+ * senha (ver models/Person.js). E por isso que a tela de manutencao consegue
+ * transformar um usuario em administrador sem pedir nada de novo alem do login
+ * e da senha.
+ *
+ * O QUE ESTA ROTA NAO MEXE: login e senha. Nem para dar, nem para tirar, nem
+ * para trocar. Isso e so da tela de manutencao (routes/dev.js). Aqui tambem
+ * nao se edita a ficha de OUTRO administrador: cada um cuida da sua
+ * (Configuracoes > Administradores).
+ */
 const router = Router();
-router.use(requireAuth);
+router.use(requireAdmin);
 
 // Sugestao enquanto digita: 10. A tela "Usuarios" pede a lista toda (ela
 // filtra no proprio navegador, como o acervo).
 const DEFAULT_LIMIT = 10;
-const MAX_LIMIT = 500;
+const MAX_LIMIT = 1000;
 
 const NAME_ERROR = "Digite o nome completo (nome e sobrenome).";
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// O que sai daqui sobre uma pessoa. A senha (nem o hash dela) nunca entra.
+function toPerson(person, extra = {}) {
+  return {
+    _id: person._id,
+    code: person.code || null,
+    fullName: person.fullName,
+    phone: person.phone || "",
+    photo: person.photo || "",
+    loansCount: person.loansCount || 0,
+    isAdmin: Boolean(person.username),
+    username: person.username || null,
+    ...extra,
+  };
 }
 
 // Livros que a pessoa tem em maos agora, por pessoa: Map(id -> [titulos]).
@@ -58,7 +93,10 @@ function readPersonFields(body) {
   return { fullName, phone };
 }
 
-// GET /api/people?search=texto&limit=10
+// GET /api/people?search=texto&limit=10&sort=code
+// - sort=code: a ordem da tela "Usuarios" (#1, #2, #3...).
+// - sem sort: ordem alfabetica, que e a util nas sugestoes de quem digita um
+//   nome ao registrar um emprestimo.
 router.get("/", async (req, res, next) => {
   try {
     const search = normalizeText(req.query.search || "");
@@ -70,28 +108,22 @@ router.get("/", async (req, res, next) => {
     const filter = {};
     if (search) filter.nameSort = new RegExp(escapeRegex(search), "i");
 
-    const people = await Person.find(filter)
-      .sort({ nameSort: 1 })
-      .limit(limit)
-      .lean();
+    // O createdAt desempata as fichas que (por algum motivo) ficaram sem
+    // numero - elas aparecem no INICIO da lista, na ordem de cadastro, porque
+    // para o Mongo "sem valor" vem antes de qualquer numero. Na pratica isso
+    // nao acontece: o servidor numera todas ao iniciar (backfillPersonCodes).
+    const order =
+      req.query.sort === "code" ? { code: 1, createdAt: 1 } : { nameSort: 1 };
 
-    const [loansByPerson, admins] = await Promise.all([
-      activeLoansByPerson(people),
-      adminPersonIds(),
-    ]);
+    const people = await Person.find(filter).sort(order).limit(limit).lean();
+    const loansByPerson = await activeLoansByPerson(people);
 
     return res.json(
-      people.map((person) => {
-        const account = admins.get(String(person._id));
-        return {
-          ...person,
+      people.map((person) =>
+        toPerson(person, {
           activeLoans: loansByPerson.get(String(person._id)) || [],
-          isAdmin: Boolean(account),
-          // Foto so existe para quem e administrador (quem pega livro
-          // emprestado nao tem foto no sistema).
-          photo: account?.photo || "",
-        };
-      }),
+        }),
+      ),
     );
   } catch (error) {
     return next(error);
@@ -106,23 +138,28 @@ router.get("/check", async (req, res, next) => {
     const nameSort = normalizeText(req.query.name || "");
     if (!nameSort) return res.json({ exists: false, activeLoans: [] });
 
-    const person = await Person.findOne({ nameSort });
+    const person = await Person.findOne({ nameSort }).lean();
     if (!person) return res.json({ exists: false, activeLoans: [] });
 
     const loans = await Loan.find({ person: person._id, status: "ativo" })
       .select("bookTitle startDate dueDate")
       .lean();
 
-    return res.json({ exists: true, person, activeLoans: loans });
+    return res.json({
+      exists: true,
+      person: toPerson(person),
+      activeLoans: loans,
+    });
   } catch (error) {
     return next(error);
   }
 });
 
-// POST /api/people  { fullName, phone, force }
+// POST /api/people  { fullName, phone, photo, force }
 // force = true: a pessoa confirmou que e alguem diferente de quem ja tem esse
 // nome (ou que o WhatsApp e compartilhado) e quer cadastrar mesmo assim.
 router.post("/", async (req, res, next) => {
+  let uploaded = null;
   try {
     const fields = readPersonFields(req.body);
     if (fields.error) return res.status(400).json({ error: fields.error });
@@ -133,17 +170,29 @@ router.post("/", async (req, res, next) => {
       if (warning) return res.status(409).json(warning);
     }
 
-    const person = await createPerson(fields);
-    return res.status(201).json(person);
+    if (req.body.photo) {
+      assertValidImage(req.body.photo, PROFILE_PHOTO);
+      uploaded = await uploadImage(req.body.photo, PROFILE_PHOTO);
+    }
+
+    const person = await createPerson({
+      ...fields,
+      photo: uploaded ? uploaded.url : "",
+      photoPublicId: uploaded ? uploaded.publicId : "",
+    });
+    return res.status(201).json(toPerson(person));
   } catch (error) {
+    // Se a foto subiu mas o cadastro nao foi criado, nao deixa a foto orfa.
+    if (uploaded) await deleteImage(uploaded.publicId);
     return next(error);
   }
 });
 
-// PUT /api/people/:id  { fullName, phone, force }
+// PUT /api/people/:id  { fullName, phone, photo?, removePhoto?, force }
 // E aqui que se resolve "a pessoa trocou de numero": o novo numero passa a
 // valer tambem nos emprestimos que ela tem em andamento.
 router.put("/:id", async (req, res, next) => {
+  let uploaded = null;
   try {
     const fields = readPersonFields(req.body);
     if (fields.error) return res.status(400).json({ error: fields.error });
@@ -151,6 +200,16 @@ router.put("/:id", async (req, res, next) => {
     const person = await Person.findById(req.params.id);
     if (!person) {
       return res.status(404).json({ error: "Pessoa não encontrada." });
+    }
+
+    // Ficha de OUTRO administrador nao se edita por aqui: cada um cuida da
+    // sua em Configuracoes > Administradores.
+    if (person.username && String(person._id) !== String(req.user.id)) {
+      return res.status(403).json({
+        error:
+          person.fullName +
+          " é administrador(a): só a própria pessoa edita esse cadastro.",
+      });
     }
 
     if (!req.body.force) {
@@ -162,13 +221,36 @@ router.put("/:id", async (req, res, next) => {
       if (warning) return res.status(409).json(warning);
     }
 
+    if (req.body.photo) {
+      assertValidImage(req.body.photo, PROFILE_PHOTO);
+      uploaded = await uploadImage(req.body.photo, PROFILE_PHOTO);
+    }
+
+    const nameChanged = person.fullName !== fields.fullName;
+    const previousPhotoId = person.photoPublicId;
+
     person.fullName = fields.fullName;
     person.phone = fields.phone;
+    if (uploaded) {
+      person.photo = uploaded.url;
+      person.photoPublicId = uploaded.publicId;
+    } else if (req.body.removePhoto) {
+      person.photo = "";
+      person.photoPublicId = "";
+    }
     await person.save();
-    await syncActiveLoans(person);
 
-    return res.json(person);
+    await syncActiveLoans(person);
+    if (nameChanged) await syncApprovedByName(person);
+
+    // A foto antiga ficou sem uso: apaga para nao lotar o Cloudinary.
+    if (previousPhotoId && previousPhotoId !== person.photoPublicId) {
+      await deleteImage(previousPhotoId);
+    }
+
+    return res.json(toPerson(person));
   } catch (error) {
+    if (uploaded) await deleteImage(uploaded.publicId);
     return next(error);
   }
 });
@@ -196,17 +278,19 @@ router.delete("/:id", async (req, res, next) => {
       });
     }
 
-    const admins = await adminPersonIds();
-    if (admins.has(String(person._id))) {
+    if (person.username) {
       return res.status(409).json({
         error:
           person.fullName +
-          " tem conta de administrador. Exclua a conta em Configurações › Administradores antes de remover a pessoa.",
+          " é administrador(a). Desfaça o administrador na tela de manutenção antes de remover a pessoa do cadastro.",
       });
     }
 
     await Person.findByIdAndDelete(person._id);
-    return res.json({ ok: true });
+    const photoDeleted = person.photoPublicId
+      ? await deleteImage(person.photoPublicId)
+      : true;
+    return res.json({ ok: true, photoDeleted });
   } catch (error) {
     return next(error);
   }
