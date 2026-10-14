@@ -11,7 +11,7 @@ import peopleRoutes from "./src/routes/people.js";
 import publicRoutes from "./src/routes/public.js";
 import adminRoutes from "./src/routes/admins.js";
 import devRoutes from "./src/routes/dev.js";
-import { requireAdmin } from "./src/middleware/auth.js";
+import { requireAdmin, requireDev } from "./src/middleware/auth.js";
 import { isAccountUsernameShape } from "./src/services/credentials.js";
 import { devUsername, usingDefaultDevLogin } from "./src/services/devAccess.js";
 import {
@@ -52,6 +52,10 @@ app.use("/api/books", requireAdmin, express.json({ limit: "6mb" }));
 // com o mesmo cuidado: limite maior, mas so depois de checar o login.
 app.use("/api/admins", requireAdmin, express.json({ limit: "6mb" }));
 app.use("/api/people", requireAdmin, express.json({ limit: "6mb" }));
+// A tela de manutencao tambem cadastra e edita gente (com foto de perfil),
+// entao precisa do mesmo limite - e, do mesmo jeito, so depois de conferir
+// que quem esta chamando e a sessao de manutencao.
+app.use("/api/dev", requireDev, express.json({ limit: "6mb" }));
 app.use(express.json({ limit: "1mb" }));
 
 // Protecao contra tentativa de adivinhar a senha: 20 tentativas a cada 15 min.

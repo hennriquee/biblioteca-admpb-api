@@ -7,6 +7,10 @@ import {
   usernameTaken,
 } from "../services/credentials.js";
 import { IS_ADMIN_FILTER } from "../services/people.js";
+import {
+  createPersonHandler,
+  updatePersonHandler,
+} from "./people.js";
 
 /**
  * TELA DE MANUTENCAO. Aberta so pelo login reservado (ver
@@ -22,8 +26,19 @@ import { IS_ADMIN_FILTER } from "../services/people.js";
  *   perde o acesso ao painel;
  * - trocar a senha (ou o login) de um administrador.
  *
- * O que esta tela NAO faz: livro, emprestimo, nome, WhatsApp e foto. Isso e
- * trabalho do painel, com a conta de administrador.
+ * E TAMBEM CADASTRA E EDITA GENTE (nome, WhatsApp e foto), de usuario e de
+ * administrador: esta tela e a dona do cadastro, entao nao precisa de uma
+ * conta de administrador emprestada para corrigir um nome ou um numero. As
+ * regras sao exatamente as mesmas da tela "Usuarios" do painel, porque os
+ * tratadores sao os MESMOS (importados de routes/people.js); a unica
+ * diferenca e que aqui a ficha de um administrador tambem pode ser editada.
+ *
+ * O que esta tela NAO faz: livro e emprestimo - nao registra, nao confirma
+ * devolucao e nao apaga nenhum. Isso e trabalho do painel, com a conta de
+ * administrador. (Corrigir o nome ou o WhatsApp de uma pessoa aqui atualiza o
+ * que o emprestimo EM ANDAMENTO mostra dela, porque o emprestimo guarda uma
+ * copia dos dois - ver syncActiveLoans em services/people.js. O emprestimo em
+ * si continua como esta.)
  */
 const router = Router();
 router.use(requireDev);
@@ -57,6 +72,20 @@ router.get("/people", async (req, res, next) => {
     return next(error);
   }
 });
+
+// POST /api/dev/people  { fullName, phone, photo?, force }
+// Cadastra uma pessoa (sem login: so usuaria da biblioteca). Mesmas regras de
+// POST /api/people - inclusive o aviso de nome/WhatsApp repetido, que o front
+// confirma reenviando com force = true.
+router.post("/people", createPersonHandler);
+
+// PUT /api/dev/people/:id  { fullName, phone, photo?, removePhoto?, force }
+// Edita nome, WhatsApp e foto de QUALQUER pessoa do cadastro, administrador
+// incluido (o painel so deixa a propria pessoa editar a ficha dela). Login e
+// senha nao se mexem aqui: para isso sao as rotas /admin e /credentials.
+// O nome e o WhatsApp novos passam a valer tambem nos emprestimos que a pessoa
+// tem em andamento (o aviso de devolucao precisa ir para o numero certo).
+router.put("/people/:id", updatePersonHandler);
 
 // POST /api/dev/people/:id/admin  { username, password }
 // Torna administradora uma pessoa que ja esta no cadastro.

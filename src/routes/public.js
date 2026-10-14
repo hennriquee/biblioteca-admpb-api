@@ -18,8 +18,11 @@ import { IS_ADMIN_FILTER } from "../services/people.js";
  *   PUBLIC_BOOK_FIELDS (o que o banco entrega) e em toPublicBook (o que vai
  *   para a resposta). Ficam de fora: observacoes do livro, id da foto no
  *   Cloudinary e qualquer dado de quem pegou o livro.
- * - Dos emprestimos so sai a CONTAGEM de unidades emprestadas. Nome, telefone,
- *   datas e prazos nunca entram em nenhuma resposta deste arquivo.
+ * - Dos emprestimos sai a CONTAGEM de unidades emprestadas e a DATA COMBINADA
+ *   de entrega (a previsao de devolucao que o acervo mostra). Nome, telefone,
+ *   data de retirada e observacoes nunca entram em nenhuma resposta deste
+ *   arquivo: a data diz QUANDO o livro volta para a estante, nunca com quem
+ *   ele esta.
  */
 const router = Router();
 
@@ -32,7 +35,7 @@ const MAX_SEARCH_LENGTH = 80;
 
 // Unicos campos do livro que o banco entrega para estas rotas.
 const PUBLIC_BOOK_FIELDS =
-  "isbn title authors publisher year pages cover synopsis categories copies loansTotal";
+  "isbn title authors publisher year pages cover synopsis categories copies";
 
 // Na query string, "?category[$ne]=x" chega como objeto. Se isso fosse direto
 // para o filtro do Mongo, viraria um operador. Aqui so texto simples passa.
@@ -95,34 +98,51 @@ function searchClause(term) {
   return { $or: clauses };
 }
 
-// Quantas unidades de cada livro estao emprestadas agora: Map(id -> numero).
-// So numeros; nenhum dado de pessoa passa por aqui.
-async function activeLoanCounts() {
+// O que cada livro tem emprestado agora: Map(id -> { count, nextDue }).
+//  - count: quantas unidades estao fora da estante;
+//  - nextDue: a data combinada de entrega mais proxima entre elas.
+// So isso: nenhum dado de quem pegou o livro passa por aqui.
+async function activeLoanInfo() {
   const rows = await Loan.aggregate([
     { $match: { status: "ativo" } },
-    { $group: { _id: "$book", count: { $sum: 1 } } },
+    {
+      $group: {
+        _id: "$book",
+        count: { $sum: 1 },
+        // O $min ignora emprestimo sem prazo: com dois exemplares fora, um com
+        // data combinada e outro sem, vale a data que existe.
+        nextDue: { $min: "$dueDate" },
+      },
+    },
   ]);
-  return new Map(rows.map((row) => [String(row._id), row.count]));
+  return new Map(
+    rows.map((row) => [
+      String(row._id),
+      { count: row.count, nextDue: row.nextDue || null },
+    ]),
+  );
 }
 
 // Ids dos livros sem nenhuma unidade na estante (todas emprestadas). So olha
 // livros que tem emprestimo ativo, entao a lista e pequena mesmo com acervo
 // grande.
-async function fullyLoanedIds(counts) {
-  if (!counts.size) return [];
-  const books = await Book.find({ _id: { $in: [...counts.keys()] } })
+async function fullyLoanedIds(loans) {
+  if (!loans.size) return [];
+  const books = await Book.find({ _id: { $in: [...loans.keys()] } })
     .select("copies")
     .lean();
   return books
-    .filter((book) => counts.get(String(book._id)) >= (book.copies || 1))
+    .filter(
+      (book) => loans.get(String(book._id)).count >= (book.copies || 1),
+    )
     .map((book) => book._id);
 }
 
 // Monta a resposta publica de um livro. Campo novo no livro so aparece aqui se
 // for acrescentado de proposito, aos dois lugares (PUBLIC_BOOK_FIELDS e aqui).
-function toPublicBook(book, loanedCount = 0) {
+function toPublicBook(book, loans = null) {
   const copies = book.copies || 1;
-  const loaned = Math.min(loanedCount, copies);
+  const loaned = Math.min(loans?.count || 0, copies);
   return {
     id: String(book._id),
     title: book.title,
@@ -137,9 +157,11 @@ function toPublicBook(book, loanedCount = 0) {
     copies,
     loaned,
     available: copies - loaned,
-    // Quantas vezes o livro ja saiu emprestado. E so um numero: nao diz quem
-    // pegou, nem quando.
-    loansTotal: book.loansTotal || 0,
+    // PREVISAO DE ENTREGA: a data combinada para o exemplar emprestado voltar
+    // para a estante. Com mais de um exemplar fora, e a mais proxima entre as
+    // datas combinadas. null quando nada esta emprestado ou quando o
+    // emprestimo foi feito sem prazo combinado.
+    dueDate: loans?.nextDue ? new Date(loans.nextDue).toISOString() : null,
   };
 }
 
@@ -171,11 +193,11 @@ async function libraryStaff() {
 //  - unavailable: livros com TODAS as unidades emprestadas
 router.get("/overview", async (req, res, next) => {
   try {
-    const counts = await activeLoanCounts();
+    const loans = await activeLoanInfo();
     const [titles, outIds, categoryRows, staff] =
       await Promise.all([
         Book.countDocuments(),
-        fullyLoanedIds(counts),
+        fullyLoanedIds(loans),
         Book.aggregate([
           { $unwind: "$categories" },
           { $match: { categories: { $ne: "" } } },
@@ -233,16 +255,16 @@ router.get("/books", async (req, res, next) => {
     // consultar os livros. Sem ele, as consultas vao juntas ao banco (cada
     // ida e volta ao banco custa tempo; em fila, a resposta demora o triplo).
     const filtersByStatus = status === "disponivel" || status === "emprestado";
-    const countsPromise = activeLoanCounts();
+    const loansPromise = activeLoanInfo();
     if (filtersByStatus) {
-      const outIds = await fullyLoanedIds(await countsPromise);
+      const outIds = await fullyLoanedIds(await loansPromise);
       filter._id = status === "emprestado" ? { $in: outIds } : { $nin: outIds };
     }
 
     // O _id no fim da ordenacao desempata titulos iguais: sem ele, o mesmo
     // livro poderia repetir (ou sumir) entre uma pagina e outra.
-    const [counts, books, total, mostLoanedId] = await Promise.all([
-      countsPromise,
+    const [loans, books, total, mostLoanedId] = await Promise.all([
+      loansPromise,
       Book.find(filter)
         .select(PUBLIC_BOOK_FIELDS)
         .sort({ titleOrder: 1, titleSort: 1, _id: 1 })
@@ -256,7 +278,7 @@ router.get("/books", async (req, res, next) => {
     res.set("Cache-Control", "no-cache");
     return res.json({
       items: books.map((book) =>
-        toPublicBook(book, counts.get(String(book._id))),
+        toPublicBook(book, loans.get(String(book._id))),
       ),
       total,
       page,

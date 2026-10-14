@@ -3,7 +3,6 @@ import Person from "../models/Person.js";
 import Loan from "../models/Loan.js";
 import { normalizeText } from "../models/Book.js";
 import { requireAdmin } from "../middleware/auth.js";
-import { normalizePhone, PHONE_ERROR } from "../services/phone.js";
 import {
   assertValidImage,
   deleteImage,
@@ -11,10 +10,9 @@ import {
   uploadImage,
 } from "../services/images.js";
 import {
-  cleanPersonName,
   createPerson,
   findSimilarPeople,
-  isFullName,
+  readPersonFields,
   similarPeopleWarning,
   syncActiveLoans,
   syncApprovedByName,
@@ -33,6 +31,13 @@ import {
  * para trocar. Isso e so da tela de manutencao (routes/dev.js). Aqui tambem
  * nao se edita a ficha de OUTRO administrador: cada um cuida da sua
  * (Configuracoes > Administradores).
+ *
+ * CADASTRAR E EDITAR GENTE ACONTECE EM DUAS TELAS, com as mesmas regras: a
+ * "Usuarios" do painel e a de manutencao. Para nao existirem duas versoes da
+ * mesma regra (uma delas sempre ficaria para tras), os dois tratadores abaixo
+ * sao exportados e a tela de manutencao monta os MESMOS em /api/dev/people
+ * (ver routes/dev.js). A unica diferenca entre as duas esta marcada no
+ * updatePersonHandler.
  */
 const router = Router();
 router.use(requireAdmin);
@@ -41,8 +46,6 @@ router.use(requireAdmin);
 // filtra no proprio navegador, como o acervo).
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 1000;
-
-const NAME_ERROR = "Digite o nome completo (nome e sobrenome).";
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -78,19 +81,6 @@ async function activeLoansByPerson(people) {
     byPerson.set(key, [...(byPerson.get(key) || []), loan.bookTitle]);
   });
   return byPerson;
-}
-
-// Le nome e telefone do corpo da requisicao e devolve { fullName, phone } ou
-// uma mensagem de erro em "error".
-function readPersonFields(body) {
-  const fullName = cleanPersonName(body.fullName ?? body.name);
-  if (!fullName) return { error: "Informe o nome da pessoa." };
-  if (!isFullName(fullName)) return { error: NAME_ERROR };
-
-  const phone = normalizePhone(body.phone);
-  if (phone === null) return { error: PHONE_ERROR };
-
-  return { fullName, phone };
 }
 
 // GET /api/people?search=texto&limit=10&sort=code
@@ -155,10 +145,14 @@ router.get("/check", async (req, res, next) => {
   }
 });
 
-// POST /api/people  { fullName, phone, photo, force }
+// POST /api/people  (e POST /api/dev/people)  { fullName, phone, photo, force }
 // force = true: a pessoa confirmou que e alguem diferente de quem ja tem esse
 // nome (ou que o WhatsApp e compartilhado) e quer cadastrar mesmo assim.
-router.post("/", async (req, res, next) => {
+//
+// Quem nasce aqui nasce SEM login (ver createPerson): nem esta rota nem a de
+// manutencao criam alguem que ja entre no painel - dar login e senha e um
+// segundo passo, so da tela de manutencao.
+export async function createPersonHandler(req, res, next) {
   let uploaded = null;
   try {
     const fields = readPersonFields(req.body);
@@ -186,12 +180,13 @@ router.post("/", async (req, res, next) => {
     if (uploaded) await deleteImage(uploaded.publicId);
     return next(error);
   }
-});
+}
 
-// PUT /api/people/:id  { fullName, phone, photo?, removePhoto?, force }
+// PUT /api/people/:id  (e PUT /api/dev/people/:id)
+// { fullName, phone, photo?, removePhoto?, force }
 // E aqui que se resolve "a pessoa trocou de numero": o novo numero passa a
 // valer tambem nos emprestimos que ela tem em andamento.
-router.put("/:id", async (req, res, next) => {
+export async function updatePersonHandler(req, res, next) {
   let uploaded = null;
   try {
     const fields = readPersonFields(req.body);
@@ -202,9 +197,16 @@ router.put("/:id", async (req, res, next) => {
       return res.status(404).json({ error: "Pessoa não encontrada." });
     }
 
-    // Ficha de OUTRO administrador nao se edita por aqui: cada um cuida da
-    // sua em Configuracoes > Administradores.
-    if (person.username && String(person._id) !== String(req.user.id)) {
+    // Ficha de OUTRO administrador nao se edita pelo painel: cada um cuida da
+    // sua em Configuracoes > Minha conta. A sessao de manutencao passa por
+    // esta trava de proposito - ela e a dona de quem entra no painel e e a
+    // unica que edita a ficha de um administrador sem ser a propria pessoa.
+    const isDevSession = req.user.role === "dev";
+    if (
+      !isDevSession &&
+      person.username &&
+      String(person._id) !== String(req.user.id)
+    ) {
       return res.status(403).json({
         error:
           person.fullName +
@@ -253,7 +255,10 @@ router.put("/:id", async (req, res, next) => {
     if (uploaded) await deleteImage(uploaded.publicId);
     return next(error);
   }
-});
+}
+
+router.post("/", createPersonHandler);
+router.put("/:id", updatePersonHandler);
 
 // DELETE /api/people/:id
 // Nao apaga nada de historico: os emprestimos ja devolvidos guardam uma copia

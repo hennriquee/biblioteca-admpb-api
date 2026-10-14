@@ -8,8 +8,11 @@ import LegacyUser from "../models/User.js";
 import Loan from "../models/Loan.js";
 import Counter from "../models/Counter.js";
 import { normalizeText } from "../models/Book.js";
+import { normalizePhone, PHONE_ERROR } from "./phone.js";
 
 export const MAX_NAME_LENGTH = 80;
+
+export const NAME_ERROR = "Digite o nome completo (nome e sobrenome).";
 
 // Pessoa que entra no painel = pessoa com login. Usado nos filtros do Mongo.
 export const IS_ADMIN_FILTER = { username: { $type: "string" } };
@@ -25,6 +28,21 @@ export function cleanPersonName(value) {
 
 export function isFullName(name) {
   return cleanPersonName(name).split(" ").filter(Boolean).length >= 2;
+}
+
+// Le nome e telefone do corpo da requisicao e devolve { fullName, phone } ou
+// uma mensagem de erro em "error". Fica aqui porque as duas telas que
+// cadastram gente usam as MESMAS regras: a tela "Usuarios" do painel
+// (routes/people.js) e a de manutencao (routes/dev.js).
+export function readPersonFields(body) {
+  const fullName = cleanPersonName(body.fullName ?? body.name);
+  if (!fullName) return { error: "Informe o nome da pessoa." };
+  if (!isFullName(fullName)) return { error: NAME_ERROR };
+
+  const phone = normalizePhone(body.phone);
+  if (phone === null) return { error: PHONE_ERROR };
+
+  return { fullName, phone };
 }
 
 // Proximo numero visivel de pessoa (#1, #2, #3...). O $inc e atomico: dois
