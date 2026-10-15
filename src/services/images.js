@@ -41,8 +41,10 @@ export const PROFILE_PHOTO = {
 
 const FOLDERS = [BOOK_COVER.folder, PROFILE_PHOTO.folder];
 
-// Limite do arquivo ja decodificado. O front manda ~150 KB (capa) ou ~60 KB
-// (perfil); 4 MB e folga de sobra e impede abuso.
+// Limite do arquivo ja decodificado. O front manda ~150 KB (capa), ~60 KB
+// (perfil com fundo) ou ate algumas centenas de KB (perfil recortado, que e
+// PNG com transparencia e nao comprime como JPEG - ver services/background.js);
+// 4 MB e folga de sobra e impede abuso.
 const MAX_BYTES = 4 * 1024 * 1024;
 
 const DATA_URI_PATTERN = /^data:image\/(?:jpeg|png|webp);base64,/i;

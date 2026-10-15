@@ -10,6 +10,7 @@ import loanRoutes from "./src/routes/loans.js";
 import peopleRoutes from "./src/routes/people.js";
 import publicRoutes from "./src/routes/public.js";
 import adminRoutes from "./src/routes/admins.js";
+import photoRoutes from "./src/routes/photos.js";
 import devRoutes from "./src/routes/dev.js";
 import { requireAdmin, requireDev } from "./src/middleware/auth.js";
 import { isAccountUsernameShape } from "./src/services/credentials.js";
@@ -52,6 +53,9 @@ app.use("/api/books", requireAdmin, express.json({ limit: "6mb" }));
 // com o mesmo cuidado: limite maior, mas so depois de checar o login.
 app.use("/api/admins", requireAdmin, express.json({ limit: "6mb" }));
 app.use("/api/people", requireAdmin, express.json({ limit: "6mb" }));
+// Recorte do fundo da foto de perfil: recebe e devolve uma foto inteira
+// (data URI), entao tem o mesmo limite maior - e tambem so depois do login.
+app.use("/api/photo", requireAdmin, express.json({ limit: "6mb" }));
 // A tela de manutencao tambem cadastra e edita gente (com foto de perfil),
 // entao precisa do mesmo limite - e, do mesmo jeito, so depois de conferir
 // que quem esta chamando e a sessao de manutencao.
@@ -97,6 +101,11 @@ app.use("/api/books", bookRoutes);
 app.use("/api/loans", loanRoutes);
 app.use("/api/people", peopleRoutes);
 app.use("/api/admins", adminRoutes);
+// O recorte de fundo atende as duas sessoes, no mesmo router: a de
+// administrador (/api/photo) e a de manutencao (/api/dev/photo), que tambem
+// cadastra gente com foto. Vem antes de devRoutes so para ficar visivel aqui.
+app.use("/api/photo", photoRoutes);
+app.use("/api/dev/photo", photoRoutes);
 // Tela de manutencao: login e senha de quem entra no painel. So a sessao do
 // login reservado passa daqui (ver src/services/devAccess.js).
 app.use("/api/dev", devRoutes);
