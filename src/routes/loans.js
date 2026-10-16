@@ -4,15 +4,7 @@ import Book, { normalizeText } from "../models/Book.js";
 import Person from "../models/Person.js";
 import { requireAdmin } from "../middleware/auth.js";
 import { normalizePhone, PHONE_ERROR } from "../services/phone.js";
-import {
-  cleanPersonName,
-  createPerson,
-  describePerson,
-  findSimilarPeople,
-  isFullName,
-  syncActiveLoans,
-  withAdminFlag,
-} from "../services/people.js";
+import { syncActiveLoans, withAdminFlag } from "../services/people.js";
 
 const router = Router();
 router.use(requireAdmin);
@@ -59,11 +51,10 @@ router.get("/:id", async (req, res, next) => {
   }
 });
 
-// POST /api/loans  { bookId, personName, startDate, dueDate, notes, force }
+// POST /api/loans  { bookId, personId, startDate, dueDate, notes, force }
 router.post("/", async (req, res, next) => {
   try {
     const { bookId, startDate, dueDate, notes } = req.body;
-    const personName = cleanPersonName(req.body.personName);
     const force = Boolean(req.body.force);
     const phone = normalizePhone(req.body.phone);
 
@@ -71,20 +62,14 @@ router.post("/", async (req, res, next) => {
       return res.status(400).json({ error: PHONE_ERROR });
     }
     if (!bookId) return res.status(400).json({ error: "Escolha um livro." });
-    // Com a pessoa escolhida na lista (personId), o nome vale o que esta no
-    // cadastro dela - o texto digitado nem e olhado. A exigencia de nome e
-    // sobrenome e so para quem esta sendo cadastrado agora.
+    // A pessoa precisa estar cadastrada ANTES do emprestimo: sem personId nao
+    // ha ficha para cobrar a devolucao depois. O cadastro e feito na tela de
+    // Usuarios (ou pelo "Cadastrar nova pessoa" do proprio Novo emprestimo) -
+    // esta rota nunca cria gente a partir so de um nome digitado.
     if (!req.body.personId) {
-      if (!personName) {
-        return res
-          .status(400)
-          .json({ error: "Informe o nome de quem está levando o livro." });
-      }
-      if (!isFullName(personName)) {
-        return res
-          .status(400)
-          .json({ error: "Digite o nome completo (nome e sobrenome)." });
-      }
+      return res.status(400).json({
+        error: "Selecione a pessoa cadastrada antes de registrar o empréstimo.",
+      });
     }
     if (!startDate)
       return res.status(400).json({ error: "Informe a data de retirada." });
@@ -130,34 +115,12 @@ router.post("/", async (req, res, next) => {
       });
     }
 
-    // QUEM esta levando o livro. O normal e o app mandar "personId" (a pessoa
-    // escolhida na lista de sugestoes): o cadastro da pessoa e a identidade,
-    // nao o nome. Sem personId, um nome igual ao de alguem que ja existe para
-    // a pergunta de quem e quem (ver models/Person.js).
-    let person = null;
-    if (req.body.personId) {
-      person = await Person.findById(req.body.personId);
-      if (!person) {
-        return res.status(404).json({ error: "Pessoa não encontrada." });
-      }
-    } else {
-      const { sameName } = await findSimilarPeople({ fullName: personName });
-      if (sameName.length && !req.body.newPerson) {
-        // Pode ser a mesma pessoa (o normal) ou uma homónima. O app
-        // pergunta e reenvia com personId ou com newPerson = true.
-        return res.status(409).json({
-          code: "PERSON_NAME_EXISTS",
-          error:
-            sameName.length === 1
-              ? describePerson(sameName[0]) +
-                " já está no cadastro. É a mesma pessoa?"
-              : "Há " +
-                sameName.length +
-                " pessoas cadastradas com esse nome. Escolha de quem se trata.",
-          people: sameName,
-        });
-      }
-      person = await createPerson({ fullName: personName, phone });
+    // QUEM esta levando o livro: sempre a pessoa escolhida na lista de
+    // sugestoes (personId) - o cadastro dela e a identidade, nunca um nome
+    // digitado na hora (ver models/Person.js).
+    const person = await Person.findById(req.body.personId);
+    if (!person) {
+      return res.status(404).json({ error: "Pessoa não encontrada." });
     }
 
     const openLoans = await Loan.find({ person: person._id, status: "ativo" })
