@@ -228,7 +228,12 @@ router.get("/overview", async (req, res, next) => {
 // - category: nome exato da categoria (como listado em /overview)
 // - status: "disponivel" (tem unidade na estante) ou "emprestado" (todas as
 //   unidades emprestadas). Qualquer outro valor = todos.
-// Sempre paginado e em ordem alfabetica.
+// - since: so livros cadastrados DEPOIS desta data/hora (ISO). Alimenta a
+//   tela de novidades (/catalogo/novidades) - "desde a ultima visita" quem
+//   decide e o front, comparando com o que guardou no localStorage.
+// - sort=newest: mais novo primeiro (por data de cadastro), em vez da ordem
+//   alfabetica padrao. So usado junto com "since".
+// Sempre paginado; em ordem alfabetica, exceto com sort=newest.
 router.get("/books", async (req, res, next) => {
   try {
     const search = normalizeText(
@@ -245,11 +250,19 @@ router.get("/books", async (req, res, next) => {
       1,
       MAX_PAGE_SIZE,
     );
+    const newest = textParam(req.query.sort) === "newest";
 
     const filter = {};
     if (category) filter.categories = category;
     const clause = searchClause(search);
     if (clause) Object.assign(filter, clause);
+    // Data invalida (ou ausente) e ignorada em silencio, como os demais
+    // parametros desta rota - nunca vira erro 500 por causa de um link velho
+    // ou de alguem adulterando a query string.
+    const since = new Date(textParam(req.query.since));
+    if (!Number.isNaN(since.getTime())) {
+      filter.createdAt = { $gt: since };
+    }
 
     // So o filtro por situacao precisa da contagem de emprestimos ANTES de
     // consultar os livros. Sem ele, as consultas vao juntas ao banco (cada
@@ -267,7 +280,11 @@ router.get("/books", async (req, res, next) => {
       loansPromise,
       Book.find(filter)
         .select(PUBLIC_BOOK_FIELDS)
-        .sort({ titleOrder: 1, titleSort: 1, _id: 1 })
+        .sort(
+          newest
+            ? { createdAt: -1, _id: -1 }
+            : { titleOrder: 1, titleSort: 1, _id: 1 },
+        )
         .skip((page - 1) * limit)
         .limit(limit)
         .lean(),
