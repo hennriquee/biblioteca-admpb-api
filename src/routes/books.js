@@ -13,6 +13,7 @@ import {
   deleteImage,
   uploadImage,
 } from "../services/images.js";
+import { fetchRemoteImage } from "../services/remoteImage.js";
 
 const router = Router();
 router.use(requireAdmin);
@@ -241,6 +242,20 @@ router.get("/cover-search", async (req, res, next) => {
     }
     const results = await searchCoverImages(q);
     return res.json({ results });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// GET /api/books/cover-source?url=<endereco da capa> -> { image: data URI }
+// Entrega ao app a capa que ja esta no livro quando ela e um link de outro
+// site: o navegador nao deixa o app ler os pontos de uma imagem de fora (CORS),
+// entao "Editar capa" (recortar, ampliar, girar) pede a imagem ao servidor.
+// Ver services/remoteImage.js para as travas contra uso indevido.
+router.get("/cover-source", async (req, res, next) => {
+  try {
+    const image = await fetchRemoteImage(req.query.url);
+    return res.json({ image });
   } catch (error) {
     return next(error);
   }
