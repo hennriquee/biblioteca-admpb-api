@@ -44,6 +44,10 @@ const MIN_TEXT_LENGTH = 2;
 
 // Por rede (IP), no banco: quantas sugestoes em 24 horas.
 export const MAX_PER_DEVICE_PER_DAY = 25;
+// Por rede, sugestoes ACEITAS em 10 minutos: segura quem tenta encher a lista
+// rapido (e esgotar o teto do dia de todo mundo) sem barrar, de uma vez so, a
+// igreja inteira no mesmo Wi-Fi.
+export const MAX_PER_DEVICE_PER_10_MIN = 8;
 // Do acervo inteiro, por dia (de Brasilia): um ataque vindo de muitos IPs para aqui.
 export const MAX_PER_DAY = 100;
 // Fotos novas no Cloudinary por dia (o plano gratis tem cota).
@@ -197,7 +201,12 @@ publicSuggestions.post("/", burstLimiter, async (req, res, next) => {
 
     // Robo preencheu o campo escondido: responde como se tivesse dado certo
     // (para ele nao aprender a desviar) e nao grava nada.
-    if (typeof body.website === "string" && body.website.trim()) {
+    // (Qualquer coisa que nao seja texto vazio: o app sempre manda "".)
+    if (
+      body.website !== undefined &&
+      body.website !== null &&
+      !(typeof body.website === "string" && !body.website.trim())
+    ) {
       return res.status(201).json({ ok: true });
     }
 
@@ -228,12 +237,21 @@ publicSuggestions.post("/", burstLimiter, async (req, res, next) => {
 
     const who = whoIs(req);
     const since = new Date(Date.now() - DAY_MS);
-    const [mine, stored] = await Promise.all([
+    const [mine, mineNow, stored] = await Promise.all([
       SuggestionThrottle.countDocuments({ who, createdAt: { $gt: since } }),
+      SuggestionThrottle.countDocuments({
+        who,
+        createdAt: { $gt: new Date(Date.now() - 10 * 60 * 1000) },
+      }),
       BookSuggestion.estimatedDocumentCount(),
     ]);
     // A mensagem fala da REDE, nao da pessoa: no Wi-Fi da igreja, quem bate
     // no limite pode nunca ter mandado nada.
+    if (mineNow >= MAX_PER_DEVICE_PER_10_MIN) {
+      return res.status(429).json({
+        error: "Recebemos muitas sugestões desta rede agora. Aguarde alguns minutos e tente de novo.",
+      });
+    }
     if (mine >= MAX_PER_DEVICE_PER_DAY) {
       return res.status(429).json({
         error: "Recebemos muitas sugestões desta rede hoje. Tente de novo amanhã.",
