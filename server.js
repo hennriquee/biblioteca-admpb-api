@@ -9,12 +9,14 @@ import bookRoutes from "./src/routes/books.js";
 import loanRoutes from "./src/routes/loans.js";
 import peopleRoutes from "./src/routes/people.js";
 import publicRoutes from "./src/routes/public.js";
+import alertRoutes from "./src/routes/alerts.js";
 import adminRoutes from "./src/routes/admins.js";
 import photoRoutes from "./src/routes/photos.js";
 import devRoutes from "./src/routes/dev.js";
 import { requireAdmin, requireDev } from "./src/middleware/auth.js";
 import { isAccountUsernameShape } from "./src/services/credentials.js";
 import { devUsername, usingDefaultDevLogin } from "./src/services/devAccess.js";
+import { getPushKeys, retryPendingAlerts } from "./src/services/returnAlerts.js";
 import {
   backfillBookLoanTotals,
   backfillTitleOrder,
@@ -60,6 +62,24 @@ app.use("/api/photo", requireAdmin, express.json({ limit: "6mb" }));
 // entao precisa do mesmo limite - e, do mesmo jeito, so depois de conferir
 // que quem esta chamando e a sessao de manutencao.
 app.use("/api/dev", requireDev, express.json({ limit: "6mb" }));
+// "Avise-me quando voltar" do acervo publico: rota SEM login, entao o corpo
+// aceito e minusculo (a inscricao de notificacao tem menos de 1 KB). Corpo
+// grande demais ou que nao e JSON recebe resposta em portugues, como o resto
+// da area publica (o tratador central mostraria o texto em ingles do leitor).
+app.use(
+  "/api/public/alerts",
+  express.json({ limit: "8kb" }),
+  (err, req, res, next) => {
+    if (err.type === "entity.too.large") {
+      return res.status(413).json({ error: "Pedido grande demais." });
+    }
+    // Qualquer outro erro do leitor (JSON quebrado, codificacao estranha...).
+    if (err.type) {
+      return res.status(err.status || 400).json({ error: "Pedido inválido." });
+    }
+    return next(err);
+  },
+);
 app.use(express.json({ limit: "1mb" }));
 
 // Protecao contra tentativa de adivinhar a senha: 20 tentativas a cada 15 min.
@@ -74,9 +94,11 @@ const loginLimiter = rateLimit({
 });
 
 // Consulta publica do acervo (pagina /catalogo): unica parte da API sem login.
-// So tem GET e so devolve dados do livro e contagens. Como qualquer pessoa
-// pode chamar, tem limite por IP (folgado, porque uma sala inteira na mesma
-// rede Wi-Fi aparece como um IP so).
+// So devolve dados do livro e contagens; a unica coisa que grava e o pedido
+// de "Avise-me quando voltar" (routes/alerts.js), que nao tem dado pessoal.
+// Como qualquer pessoa pode chamar, tem limite por IP (folgado, porque uma
+// sala inteira na mesma rede Wi-Fi aparece como um IP so). O mesmo limite
+// vale para as duas partes juntas.
 const publicLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 150,
@@ -109,6 +131,8 @@ app.use("/api/dev/photo", photoRoutes);
 // Tela de manutencao: login e senha de quem entra no painel. So a sessao do
 // login reservado passa daqui (ver src/services/devAccess.js).
 app.use("/api/dev", devRoutes);
+// Os avisos vem antes do acervo: "/api/public" tambem casaria com eles.
+app.use("/api/public/alerts", publicLimiter, alertRoutes);
 app.use("/api/public", publicLimiter, publicRoutes);
 
 // Rota nao encontrada
@@ -206,6 +230,23 @@ async function prepareDatabase() {
               "). Quem precisar desse acesso recebe um login novo na tela de manutenção.",
           );
         });
+      },
+    },
+    {
+      // Cria (so na primeira vez) as chaves que assinam as notificacoes do
+      // "Avise-me quando voltar". Se falhar aqui, a primeira pessoa que
+      // pedir aviso faz uma nova tentativa.
+      what: "as chaves dos avisos de devolução",
+      async run() {
+        await getPushKeys();
+      },
+    },
+    {
+      // Avisos que ficaram para tras (livro ja na estante, aviso que nao
+      // saiu). Roda em segundo plano: nao segura a subida do servidor.
+      what: "os avisos de devolução pendentes",
+      async run() {
+        retryPendingAlerts();
       },
     },
     {

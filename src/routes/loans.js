@@ -5,6 +5,7 @@ import Person from "../models/Person.js";
 import { requireAdmin } from "../middleware/auth.js";
 import { normalizePhone, PHONE_ERROR } from "../services/phone.js";
 import { syncActiveLoans, withAdminFlag } from "../services/people.js";
+import { announceAvailability } from "../services/returnAlerts.js";
 
 const router = Router();
 router.use(requireAdmin);
@@ -247,6 +248,10 @@ router.patch("/:id/return", async (req, res, next) => {
     loan.returnedAt = new Date();
     await loan.save();
 
+    // Quem pediu "Avise-me quando voltar" no acervo publico recebe a
+    // notificacao agora. Nao atrasa esta resposta (ver services/returnAlerts.js).
+    announceAvailability(loan.book);
+
     return res.json(await withAdminFlag(loan.toObject()));
   } catch (error) {
     return next(error);
@@ -272,6 +277,9 @@ router.delete("/:id", async (req, res, next) => {
         { $inc: { loansCount: -1 } },
       ),
     ]);
+    // Apagar um emprestimo em andamento devolve o exemplar a estante: quem
+    // pediu aviso do livro tambem fica sabendo.
+    if (loan.status === "ativo") announceAvailability(loan.book);
     return res.json({ ok: true });
   } catch (error) {
     return next(error);

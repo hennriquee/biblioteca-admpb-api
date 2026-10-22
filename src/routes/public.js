@@ -13,7 +13,8 @@ import { IS_ADMIN_FILTER } from "../services/people.js";
  * a unica tela aberta a quem nao administra a biblioteca.
  *
  * Regras que nao podem ser quebradas aqui:
- * - So leitura (GET). Nenhuma rota que crie, edite ou exclua.
+ * - So leitura (GET). Nenhuma rota que crie, edite ou exclua. (O pedido de
+ *   "Avise-me quando voltar", que grava, fica a parte em routes/alerts.js.)
  * - Nunca devolver o documento do banco como veio: o que sai esta listado em
  *   PUBLIC_BOOK_FIELDS (o que o banco entrega) e em toPublicBook (o que vai
  *   para a resposta). Ficam de fora: observacoes do livro, id da foto no
@@ -306,6 +307,28 @@ router.get("/books", async (req, res, next) => {
       // estiver na lista que esta aparecendo.
       mostLoanedId,
     });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// GET /api/public/books/:id
+// Um livro so, no mesmo formato da lista: { book }. Usado pelo toque na
+// notificacao do "Avise-me quando voltar", que abre o catalogo ja com o
+// livro aberto (/catalogo?livro=id) - mesmo que ele nao esteja entre os
+// primeiros da lista.
+router.get("/books/:id", async (req, res, next) => {
+  try {
+    const id = textParam(req.params.id);
+    const book = /^[a-f0-9]{24}$/i.test(id)
+      ? await Book.findById(id).select(PUBLIC_BOOK_FIELDS).lean()
+      : null;
+    if (!book) {
+      return res.status(404).json({ error: "Esse livro não está mais no acervo." });
+    }
+    const loans = await activeLoanInfo();
+    res.set("Cache-Control", "no-cache");
+    return res.json({ book: toPublicBook(book, loans.get(String(book._id))) });
   } catch (error) {
     return next(error);
   }

@@ -14,6 +14,7 @@ import {
   uploadImage,
 } from "../services/images.js";
 import { fetchRemoteImage } from "../services/remoteImage.js";
+import { announceAvailability } from "../services/returnAlerts.js";
 
 const router = Router();
 router.use(requireAdmin);
@@ -430,6 +431,12 @@ router.put("/:id", async (req, res, next) => {
     if (!book) {
       if (uploaded) await deleteImage(uploaded.publicId);
       return res.status(404).json({ error: "Livro não encontrado." });
+    }
+
+    // Exemplar novo na estante: avisa quem pediu "Avise-me quando voltar" no
+    // acervo publico (ver services/returnAlerts.js; nao atrasa a resposta).
+    if ((book.copies || 1) > (previous.copies || 1)) {
+      announceAvailability(book._id);
     }
 
     // Mantem os cards de emprestimo ativos com o titulo/capa atualizados.
