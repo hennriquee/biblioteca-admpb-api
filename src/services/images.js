@@ -7,9 +7,10 @@
  * - deleteImage(publicId): apaga a foto la, para nao lotar o plano gratis.
  *
  * REGRA DA CASA: toda foto guardada aqui tem um publicId salvo no banco
- * (Book.coverPublicId, Person.photoPublicId). Sempre que esse campo deixa de
- * apontar para a foto (troca, remocao ou exclusao do registro), quem fez a
- * mudanca chama deleteImage com o publicId ANTIGO. Se a gravacao no banco
+ * (Book.coverPublicId, Person.photoPublicId, BookSuggestion.photoPublicId).
+ * Sempre que esse campo deixa de apontar para a foto (troca, remocao ou
+ * exclusao do registro), quem fez a mudanca chama deleteImage com o publicId
+ * ANTIGO. Se a gravacao no banco
  * falhar depois de um upload, a foto recem-enviada tambem e apagada: nenhuma
  * foto fica orfa no Cloudinary.
  *
@@ -39,7 +40,16 @@ export const PROFILE_PHOTO = {
   label: "a foto de perfil",
 };
 
-const FOLDERS = [BOOK_COVER.folder, PROFILE_PHOTO.folder];
+// Foto do livro que alguem do acervo publico sugeriu comprar (ver
+// routes/suggestions.js). Mesmo recorte 2:3 da capa, pasta propria.
+export const SUGGESTION_PHOTO = {
+  folder: "biblioteca-admpb/sugestoes",
+  width: 800,
+  height: 1200,
+  label: "a foto do livro",
+};
+
+const FOLDERS = [BOOK_COVER.folder, PROFILE_PHOTO.folder, SUGGESTION_PHOTO.folder];
 
 // Limite do arquivo ja decodificado. O front manda ~150 KB (capa), ~60 KB
 // (perfil com fundo) ou ate algumas centenas de KB (perfil recortado, que e

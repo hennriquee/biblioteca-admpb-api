@@ -18,7 +18,8 @@ import {
  * "Avise-me quando voltar" do acervo publico (/catalogo). Rotas SEM LOGIN,
  * montadas em /api/public/alerts (ver server.js e services/returnAlerts.js).
  *
- * Sao as unicas rotas publicas que gravam alguma coisa, e por isso:
+ * Sao rotas publicas que gravam (como o "Sugerir um livro", em
+ * routes/suggestions.js), e por isso:
  * - so gravam pedidos de aviso, nunca mexem em livro ou emprestimo;
  * - nenhuma devolve dado de emprestimo (nem com quem esta o livro, nem quem
  *   mais pediu aviso): a resposta e "ok", "ativo ou nao" e a chave publica;

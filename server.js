@@ -10,6 +10,7 @@ import loanRoutes from "./src/routes/loans.js";
 import peopleRoutes from "./src/routes/people.js";
 import publicRoutes from "./src/routes/public.js";
 import alertRoutes from "./src/routes/alerts.js";
+import suggestionRoutes, { publicSuggestions } from "./src/routes/suggestions.js";
 import adminRoutes from "./src/routes/admins.js";
 import photoRoutes from "./src/routes/photos.js";
 import devRoutes from "./src/routes/dev.js";
@@ -62,23 +63,28 @@ app.use("/api/photo", requireAdmin, express.json({ limit: "6mb" }));
 // entao precisa do mesmo limite - e, do mesmo jeito, so depois de conferir
 // que quem esta chamando e a sessao de manutencao.
 app.use("/api/dev", requireDev, express.json({ limit: "6mb" }));
+// Rotas publicas que recebem dados: corpo grande demais ou que nao e JSON
+// recebe resposta em portugues, como o resto da area publica (o tratador
+// central mostraria o texto em ingles do leitor).
+function publicBodyErrors(err, req, res, next) {
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({ error: "Pedido grande demais." });
+  }
+  // Qualquer outro erro do leitor (JSON quebrado, codificacao estranha...).
+  if (err.type) {
+    return res.status(err.status || 400).json({ error: "Pedido inválido." });
+  }
+  return next(err);
+}
 // "Avise-me quando voltar" do acervo publico: rota SEM login, entao o corpo
-// aceito e minusculo (a inscricao de notificacao tem menos de 1 KB). Corpo
-// grande demais ou que nao e JSON recebe resposta em portugues, como o resto
-// da area publica (o tratador central mostraria o texto em ingles do leitor).
+// aceito e minusculo (a inscricao de notificacao tem menos de 1 KB).
+app.use("/api/public/alerts", express.json({ limit: "8kb" }), publicBodyErrors);
+// "Sugerir um livro" do acervo publico: tambem sem login. Cabe a foto do
+// livro ja recortada pelo app (JPEG 600x900, uns 150 KB) e nada muito alem.
 app.use(
-  "/api/public/alerts",
-  express.json({ limit: "8kb" }),
-  (err, req, res, next) => {
-    if (err.type === "entity.too.large") {
-      return res.status(413).json({ error: "Pedido grande demais." });
-    }
-    // Qualquer outro erro do leitor (JSON quebrado, codificacao estranha...).
-    if (err.type) {
-      return res.status(err.status || 400).json({ error: "Pedido inválido." });
-    }
-    return next(err);
-  },
+  "/api/public/suggestions",
+  express.json({ limit: "1mb" }),
+  publicBodyErrors,
 );
 app.use(express.json({ limit: "1mb" }));
 
@@ -94,8 +100,9 @@ const loginLimiter = rateLimit({
 });
 
 // Consulta publica do acervo (pagina /catalogo): unica parte da API sem login.
-// So devolve dados do livro e contagens; a unica coisa que grava e o pedido
-// de "Avise-me quando voltar" (routes/alerts.js), que nao tem dado pessoal.
+// So devolve dados do livro e contagens; o que grava e o pedido de "Avise-me
+// quando voltar" (routes/alerts.js) e a sugestao de livro
+// (routes/suggestions.js), nenhum dos dois com dado pessoal.
 // Como qualquer pessoa pode chamar, tem limite por IP (folgado, porque uma
 // sala inteira na mesma rede Wi-Fi aparece como um IP so). O mesmo limite
 // vale para as duas partes juntas.
@@ -131,8 +138,12 @@ app.use("/api/dev/photo", photoRoutes);
 // Tela de manutencao: login e senha de quem entra no painel. So a sessao do
 // login reservado passa daqui (ver src/services/devAccess.js).
 app.use("/api/dev", devRoutes);
-// Os avisos vem antes do acervo: "/api/public" tambem casaria com eles.
+// Os avisos e as sugestoes vem antes do acervo: "/api/public" tambem casaria
+// com eles.
 app.use("/api/public/alerts", publicLimiter, alertRoutes);
+app.use("/api/public/suggestions", publicLimiter, publicSuggestions);
+// Livros sugeridos, no painel (so administrador).
+app.use("/api/suggestions", suggestionRoutes);
 app.use("/api/public", publicLimiter, publicRoutes);
 
 // Rota nao encontrada
