@@ -3,8 +3,8 @@ import rateLimit from "express-rate-limit";
 import { captchaConfig, captchaEnabled, issuePass, verifyCaptcha } from "../services/captcha.js";
 
 /**
- * /api/public/captcha - a porta de entrada do acervo publico (ver
- * services/captcha.js). Unicas rotas de /api/public que NAO pedem o passe.
+ * /api/public/captcha - a porta de entrada do site (ver services/captcha.js).
+ * Unicas rotas de /api, alem do health check, que NAO pedem o passe.
  *
  * GET  /         -> { enabled, siteKey }: se a caixa esta ligada e a chave do site.
  * POST /         { token } -> { pass, expiresIn }: confere com o Google e

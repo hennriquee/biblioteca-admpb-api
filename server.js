@@ -18,8 +18,8 @@ import captchaRoutes from "./src/routes/captcha.js";
 import { requireAdmin, requireDev } from "./src/middleware/auth.js";
 import { isAccountUsernameShape } from "./src/services/credentials.js";
 import {
-  readCatalogPass,
-  requireCatalogPass,
+  readSitePass,
+  requireSitePass,
   warnAboutCaptcha,
 } from "./src/services/captcha.js";
 import { devUsername, usingDefaultDevLogin } from "./src/services/devAccess.js";
@@ -51,29 +51,23 @@ app.use(
       if (allowedOrigins.includes(origin)) return callback(null, true);
       return callback(new Error("Origem não autorizada pelo CORS: " + origin));
     },
-    // O passe do acervo vai num cabecalho proprio (X-Catalogo-Passe), o que
+    // O passe do site vai num cabecalho proprio (X-Catalogo-Passe), o que
     // faz o navegador perguntar antes (OPTIONS) de cada endereco novo. Com
     // isso a resposta fica guardada por 10 minutos PARA AQUELE ENDERECO (o
     // mesmo endereco de novo nao pergunta; um livro diferente pergunta).
+    // (A pergunta e respondida aqui pelo cors, antes da porta do passe.)
     maxAge: 600,
   }),
 );
 
-// A rota de livros aceita a foto da capa (data URI ~150 KB, ate 4 MB), por
-// isso tem um limite maior. Vem antes do parser geral (1 MB) e so depois de
-// checar o login, para ninguem sem token conseguir mandar corpos grandes.
-app.use("/api/books", requireAdmin, express.json({ limit: "6mb" }));
-// As rotas de gente aceitam a foto de perfil (data URI), pelo mesmo motivo e
-// com o mesmo cuidado: limite maior, mas so depois de checar o login.
-app.use("/api/admins", requireAdmin, express.json({ limit: "6mb" }));
-app.use("/api/people", requireAdmin, express.json({ limit: "6mb" }));
-// Recorte do fundo da foto de perfil: recebe e devolve uma foto inteira
-// (data URI), entao tem o mesmo limite maior - e tambem so depois do login.
-app.use("/api/photo", requireAdmin, express.json({ limit: "6mb" }));
-// A tela de manutencao tambem cadastra e edita gente (com foto de perfil),
-// entao precisa do mesmo limite - e, do mesmo jeito, so depois de conferir
-// que quem esta chamando e a sessao de manutencao.
-app.use("/api/dev", requireDev, express.json({ limit: "6mb" }));
+// Verificacao de que o servidor esta de pe: a unica rota de /api (alem da
+// entrada do "Nao sou um robo") que nao pede o passe do reCAPTCHA. O app a
+// chama assim que abre, para acordar o Render, e o UptimeRobot, se houver,
+// tambem - nenhum dos dois tem passe.
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
 // Rotas publicas que recebem dados: corpo grande demais ou que nao e JSON
 // recebe resposta em portugues, como o resto da area publica (o tratador
 // central mostraria o texto em ingles do leitor).
@@ -87,9 +81,10 @@ function publicBodyErrors(err, req, res, next) {
   }
   return next(err);
 }
-// Consulta publica do acervo (pagina /catalogo): unica parte da API sem login.
-// So devolve dados do livro e contagens; o que grava e o pedido de "Avise-me
-// quando voltar" (routes/alerts.js) e a sugestao de livro
+
+// Consulta publica do acervo (pagina /catalogo): a unica parte da API sem
+// login. So devolve dados do livro e contagens; o que grava e o pedido de
+// "Avise-me quando voltar" (routes/alerts.js) e a sugestao de livro
 // (routes/suggestions.js), nenhum dos dois com dado pessoal.
 // Como qualquer pessoa pode chamar, tem limite por IP (folgado, porque uma
 // sala inteira na mesma rede Wi-Fi aparece como um IP so). O mesmo limite
@@ -99,13 +94,14 @@ function publicBodyErrors(err, req, res, next) {
 // tem passe (a entrada e quem tenta sem passe), e um bem maior para quem ja
 // passou pela caixa (passIpLimiter) - cada passe ainda tem o seu proprio
 // limite (passLimiter). Assim a congregacao inteira no Wi-Fi da igreja nao
-// esbarra no limite, e um robo sem passe continua barrado cedo.
+// esbarra no limite, e um robo sem passe continua barrado cedo. Estes tres
+// limites valem so para /api/public: o painel tem o login e o proprio token.
 const publicLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 150,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => Boolean(req.catalogPassId),
+  skip: (req) => Boolean(req.sitePassId),
   message: {
     error: "Muitas consultas em pouco tempo. Aguarde um instante e tente de novo.",
   },
@@ -115,7 +111,7 @@ const passIpLimiter = rateLimit({
   max: 600,
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => !req.catalogPassId,
+  skip: (req) => !req.sitePassId,
   message: {
     error: "Muitas consultas em pouco tempo. Aguarde um instante e tente de novo.",
   },
@@ -129,9 +125,9 @@ const passLimiter = rateLimit({
   max: 120,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => "passe:" + (req.catalogPassId || "nenhum"),
+  keyGenerator: (req) => "passe:" + (req.sitePassId || "nenhum"),
   // Sem o reCAPTCHA ligado nao ha passe; o limite por IP ja vale.
-  skip: (req) => !req.catalogPassId,
+  skip: (req) => !req.sitePassId,
   message: {
     error: "Muitas consultas em pouco tempo. Aguarde um instante e tente de novo.",
   },
@@ -153,10 +149,11 @@ const entranceLimiter = rateLimit({
   },
 });
 
-// Porta de entrada do acervo publico: o "Nao sou um robo" (sem passe) e,
-// depois dela, TODA rota de /api/public/* exige o passe. Fica antes dos
-// leitores de corpo abaixo, para quem nao tem passe nao conseguir nem fazer
-// o servidor ler um corpo de 1 MB.
+// Porta de entrada do SITE: o "Nao sou um robo" (sem passe) e, depois dela,
+// TODA rota de /api exige o passe - acervo publico, login e painel. Fica antes
+// dos leitores de corpo abaixo, para quem nao tem passe nao conseguir nem
+// fazer o servidor ler um corpo de 6 MB, nem gastar as tentativas do login.
+// (O pedido OPTIONS do navegador e respondido pelo cors, la em cima.)
 app.use(
   "/api/public/captcha",
   entranceLimiter,
@@ -164,15 +161,26 @@ app.use(
   publicBodyErrors,
   captchaRoutes,
 );
-app.use(
-  "/api/public",
-  readCatalogPass,
-  publicLimiter,
-  passIpLimiter,
-  requireCatalogPass,
-  passLimiter,
-);
+app.use("/api", readSitePass);
+app.use("/api/public", publicLimiter);
+app.use("/api", requireSitePass);
+app.use("/api/public", passIpLimiter, passLimiter);
 
+// A rota de livros aceita a foto da capa (data URI ~150 KB, ate 4 MB), por
+// isso tem um limite maior. Vem antes do parser geral (1 MB) e so depois de
+// checar o login, para ninguem sem token conseguir mandar corpos grandes.
+app.use("/api/books", requireAdmin, express.json({ limit: "6mb" }));
+// As rotas de gente aceitam a foto de perfil (data URI), pelo mesmo motivo e
+// com o mesmo cuidado: limite maior, mas so depois de checar o login.
+app.use("/api/admins", requireAdmin, express.json({ limit: "6mb" }));
+app.use("/api/people", requireAdmin, express.json({ limit: "6mb" }));
+// Recorte do fundo da foto de perfil: recebe e devolve uma foto inteira
+// (data URI), entao tem o mesmo limite maior - e tambem so depois do login.
+app.use("/api/photo", requireAdmin, express.json({ limit: "6mb" }));
+// A tela de manutencao tambem cadastra e edita gente (com foto de perfil),
+// entao precisa do mesmo limite - e, do mesmo jeito, so depois de conferir
+// que quem esta chamando e a sessao de manutencao.
+app.use("/api/dev", requireDev, express.json({ limit: "6mb" }));
 // "Avise-me quando voltar" do acervo publico: rota SEM login, entao o corpo
 // aceito e minusculo (a inscricao de notificacao tem menos de 1 KB).
 app.use("/api/public/alerts", express.json({ limit: "8kb" }), publicBodyErrors);
@@ -200,10 +208,6 @@ app.get("/", (req, res) => {
   res.json({ name: "Biblioteca ADMP Brasil API", status: "online" });
 });
 
-app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", time: new Date().toISOString() });
-});
-
 app.use("/api/auth/login", loginLimiter);
 app.use("/api/auth", authRoutes);
 app.use("/api/books", bookRoutes);
@@ -219,8 +223,8 @@ app.use("/api/dev/photo", photoRoutes);
 // login reservado passa daqui (ver src/services/devAccess.js).
 app.use("/api/dev", devRoutes);
 // Os avisos e as sugestoes vem antes do acervo: "/api/public" tambem casaria
-// com eles. (O limite por IP e o passe do reCAPTCHA ja foram conferidos la
-// em cima, para toda a area publica.)
+// com eles. (O passe do reCAPTCHA e os limites por IP ja foram conferidos la
+// em cima, para toda a API.)
 app.use("/api/public/alerts", alertRoutes);
 app.use("/api/public/suggestions", publicSuggestions);
 // Livros sugeridos, no painel (so administrador).
