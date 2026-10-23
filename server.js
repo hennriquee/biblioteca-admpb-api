@@ -14,8 +14,14 @@ import suggestionRoutes, { publicSuggestions } from "./src/routes/suggestions.js
 import adminRoutes from "./src/routes/admins.js";
 import photoRoutes from "./src/routes/photos.js";
 import devRoutes from "./src/routes/dev.js";
+import captchaRoutes from "./src/routes/captcha.js";
 import { requireAdmin, requireDev } from "./src/middleware/auth.js";
 import { isAccountUsernameShape } from "./src/services/credentials.js";
+import {
+  readCatalogPass,
+  requireCatalogPass,
+  warnAboutCaptcha,
+} from "./src/services/captcha.js";
 import { devUsername, usingDefaultDevLogin } from "./src/services/devAccess.js";
 import { getPushKeys, retryPendingAlerts } from "./src/services/returnAlerts.js";
 import {
@@ -45,6 +51,11 @@ app.use(
       if (allowedOrigins.includes(origin)) return callback(null, true);
       return callback(new Error("Origem não autorizada pelo CORS: " + origin));
     },
+    // O passe do acervo vai num cabecalho proprio (X-Catalogo-Passe), o que
+    // faz o navegador perguntar antes (OPTIONS) de cada endereco novo. Com
+    // isso a resposta fica guardada por 10 minutos PARA AQUELE ENDERECO (o
+    // mesmo endereco de novo nao pergunta; um livro diferente pergunta).
+    maxAge: 600,
   }),
 );
 
@@ -76,6 +87,92 @@ function publicBodyErrors(err, req, res, next) {
   }
   return next(err);
 }
+// Consulta publica do acervo (pagina /catalogo): unica parte da API sem login.
+// So devolve dados do livro e contagens; o que grava e o pedido de "Avise-me
+// quando voltar" (routes/alerts.js) e a sugestao de livro
+// (routes/suggestions.js), nenhum dos dois com dado pessoal.
+// Como qualquer pessoa pode chamar, tem limite por IP (folgado, porque uma
+// sala inteira na mesma rede Wi-Fi aparece como um IP so). O mesmo limite
+// vale para todas as partes juntas.
+//
+// Com o reCAPTCHA ligado sao dois limites por IP: este, para quem ainda NAO
+// tem passe (a entrada e quem tenta sem passe), e um bem maior para quem ja
+// passou pela caixa (passIpLimiter) - cada passe ainda tem o seu proprio
+// limite (passLimiter). Assim a congregacao inteira no Wi-Fi da igreja nao
+// esbarra no limite, e um robo sem passe continua barrado cedo.
+const publicLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 150,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => Boolean(req.catalogPassId),
+  message: {
+    error: "Muitas consultas em pouco tempo. Aguarde um instante e tente de novo.",
+  },
+});
+const passIpLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => !req.catalogPassId,
+  message: {
+    error: "Muitas consultas em pouco tempo. Aguarde um instante e tente de novo.",
+  },
+});
+
+// Alem do IP, cada passe do reCAPTCHA (ver src/services/captcha.js) tem o seu
+// limite: quem marcou a caixa uma vez e tenta usar o passe num robo, de um IP
+// ou de muitos, para aqui. Abrir o catalogo gasta uns 5 pedidos.
+const passLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => "passe:" + (req.catalogPassId || "nenhum"),
+  // Sem o reCAPTCHA ligado nao ha passe; o limite por IP ja vale.
+  skip: (req) => !req.catalogPassId,
+  message: {
+    error: "Muitas consultas em pouco tempo. Aguarde um instante e tente de novo.",
+  },
+});
+
+// A entrada (GET e POST de /api/public/captcha) tem o seu proprio limite por
+// IP, e nao o de quem chega sem passe: domingo, a congregacao inteira entra
+// pelo mesmo Wi-Fi quase ao mesmo tempo, e um 429 aqui faz a pessoa marcar a
+// caixa de novo. Cada visitante novo gasta 2 pedidos (300/min = uns 150
+// visitantes por minuto numa rede so). A conferencia com o Google ainda tem o
+// limite dela (routes/captcha.js).
+const entranceLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Muita gente entrando agora. Aguarde um instante e tente de novo.",
+  },
+});
+
+// Porta de entrada do acervo publico: o "Nao sou um robo" (sem passe) e,
+// depois dela, TODA rota de /api/public/* exige o passe. Fica antes dos
+// leitores de corpo abaixo, para quem nao tem passe nao conseguir nem fazer
+// o servidor ler um corpo de 1 MB.
+app.use(
+  "/api/public/captcha",
+  entranceLimiter,
+  express.json({ limit: "16kb" }),
+  publicBodyErrors,
+  captchaRoutes,
+);
+app.use(
+  "/api/public",
+  readCatalogPass,
+  publicLimiter,
+  passIpLimiter,
+  requireCatalogPass,
+  passLimiter,
+);
+
 // "Avise-me quando voltar" do acervo publico: rota SEM login, entao o corpo
 // aceito e minusculo (a inscricao de notificacao tem menos de 1 KB).
 app.use("/api/public/alerts", express.json({ limit: "8kb" }), publicBodyErrors);
@@ -96,23 +193,6 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
   message: {
     error: "Muitas tentativas de login. Tente novamente em 15 minutos.",
-  },
-});
-
-// Consulta publica do acervo (pagina /catalogo): unica parte da API sem login.
-// So devolve dados do livro e contagens; o que grava e o pedido de "Avise-me
-// quando voltar" (routes/alerts.js) e a sugestao de livro
-// (routes/suggestions.js), nenhum dos dois com dado pessoal.
-// Como qualquer pessoa pode chamar, tem limite por IP (folgado, porque uma
-// sala inteira na mesma rede Wi-Fi aparece como um IP so). O mesmo limite
-// vale para as duas partes juntas.
-const publicLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 150,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    error: "Muitas consultas em pouco tempo. Aguarde um instante e tente de novo.",
   },
 });
 
@@ -139,12 +219,13 @@ app.use("/api/dev/photo", photoRoutes);
 // login reservado passa daqui (ver src/services/devAccess.js).
 app.use("/api/dev", devRoutes);
 // Os avisos e as sugestoes vem antes do acervo: "/api/public" tambem casaria
-// com eles.
-app.use("/api/public/alerts", publicLimiter, alertRoutes);
-app.use("/api/public/suggestions", publicLimiter, publicSuggestions);
+// com eles. (O limite por IP e o passe do reCAPTCHA ja foram conferidos la
+// em cima, para toda a area publica.)
+app.use("/api/public/alerts", alertRoutes);
+app.use("/api/public/suggestions", publicSuggestions);
 // Livros sugeridos, no painel (so administrador).
 app.use("/api/suggestions", suggestionRoutes);
-app.use("/api/public", publicLimiter, publicRoutes);
+app.use("/api/public", publicRoutes);
 
 // Rota nao encontrada
 app.use((req, res) => {
@@ -285,6 +366,7 @@ async function prepareDatabase() {
 connectDatabase()
   .then(async () => {
     warnAboutDevLogin();
+    warnAboutCaptcha();
     await prepareDatabase();
     app.listen(PORT, () => {
       console.log("API rodando na porta " + PORT);
