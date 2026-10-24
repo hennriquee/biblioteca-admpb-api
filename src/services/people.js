@@ -6,6 +6,7 @@
 import Person from "../models/Person.js";
 import LegacyUser from "../models/User.js";
 import Loan from "../models/Loan.js";
+import LoanRequest from "../models/LoanRequest.js";
 import Counter from "../models/Counter.js";
 import { normalizeText } from "../models/Book.js";
 import { normalizePhone, PHONE_ERROR } from "./phone.js";
@@ -158,15 +159,20 @@ export async function withAdminFlag(loans) {
 // Nome/telefone mudaram: os emprestimos EM ANDAMENTO passam a mostrar o dado
 // novo (e o aviso de devolucao vai para o numero novo). Os ja devolvidos
 // guardam o que valia na epoca - e historico.
+// As solicitacoes registradas (ainda nao retiradas) acompanham do mesmo jeito.
 export async function syncActiveLoans(person) {
-  await Loan.updateMany(
-    { person: person._id, status: "ativo" },
-    {
-      personName: person.fullName,
-      personNameSort: normalizeText(person.fullName),
-      personPhone: person.phone || "",
-    },
-  );
+  const fields = {
+    personName: person.fullName,
+    personNameSort: normalizeText(person.fullName),
+    personPhone: person.phone || "",
+  };
+  await Promise.all([
+    Loan.updateMany({ person: person._id, status: "ativo" }, fields),
+    LoanRequest.updateMany(
+      { person: person._id, status: { $in: ["solicitado", "convertendo"] } },
+      fields,
+    ),
+  ]);
 }
 
 // O administrador que aprovou emprestimos mudou de nome: os registros dele
@@ -174,10 +180,17 @@ export async function syncActiveLoans(person) {
 // escrita certo. (Diferente do nome de QUEM PEGOU o livro, que no historico
 // fica como estava na epoca: ali o nome e parte do registro do emprestimo.)
 export async function syncApprovedByName(person) {
-  await Loan.updateMany(
-    { approvedBy: person._id },
-    { approvedByName: person.fullName },
-  );
+  await Promise.all([
+    Loan.updateMany(
+      { approvedBy: person._id },
+      { approvedByName: person.fullName },
+    ),
+    // Quem registrou uma solicitacao, pelo mesmo motivo.
+    LoanRequest.updateMany(
+      { registeredBy: person._id },
+      { registeredByName: person.fullName },
+    ),
+  ]);
 }
 
 /**

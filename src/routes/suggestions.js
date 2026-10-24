@@ -62,7 +62,7 @@ const LINK = /(https?:\/\/|www\.)/i;
 
 // Quem e "a mesma rede": o IPv4 inteiro, ou a faixa /64 do IPv6 - cada casa
 // ganha uma faixa inteira e pode trocar de endereco dentro dela a vontade.
-function networkOf(ip) {
+export function networkOf(ip) {
   const address = String(ip || "").replace(/^::ffff:(?=\d+\.)/i, "");
   if (!address.includes(":")) return address;
   const [head, tail = ""] = address.split("::");

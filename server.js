@@ -15,6 +15,11 @@ import adminRoutes from "./src/routes/admins.js";
 import photoRoutes from "./src/routes/photos.js";
 import devRoutes from "./src/routes/dev.js";
 import captchaRoutes from "./src/routes/captcha.js";
+import requestRoutes, {
+  ogPreviewHandler,
+  publicRequests,
+  recoverStuckConversions,
+} from "./src/routes/requests.js";
 import { requireAdmin, requireDev } from "./src/middleware/auth.js";
 import { isAccountUsernameShape } from "./src/services/credentials.js";
 import {
@@ -67,6 +72,20 @@ app.use(
 app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
+
+// Previa do link de solicitacao no WhatsApp (titulo, autor e capa do livro).
+// Quem pergunta e a funcao da Vercel (frontend/api/solicitacao.js), na hora em
+// que o WhatsApp de quem vai mandar a mensagem monta a previa - ela nao tem o
+// passe do reCAPTCHA, por isso fica FORA de /api. So le, e so devolve o que
+// o acervo publico ja mostra (nada de quem pediu). Ver routes/requests.js.
+const previewLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas consultas em pouco tempo." },
+});
+app.get("/og/requests/:token", previewLimiter, ogPreviewHandler);
 
 // Rotas publicas que recebem dados: corpo grande demais ou que nao e JSON
 // recebe resposta em portugues, como o resto da area publica (o tratador
@@ -191,6 +210,8 @@ app.use(
   express.json({ limit: "1mb" }),
   publicBodyErrors,
 );
+// "Solicitar empréstimo" do acervo publico: sem login, so nome, livro e dia.
+app.use("/api/public/requests", express.json({ limit: "8kb" }), publicBodyErrors);
 app.use(express.json({ limit: "1mb" }));
 
 // Protecao contra tentativa de adivinhar a senha: 20 tentativas a cada 15 min.
@@ -212,6 +233,8 @@ app.use("/api/auth/login", loginLimiter);
 app.use("/api/auth", authRoutes);
 app.use("/api/books", bookRoutes);
 app.use("/api/loans", loanRoutes);
+// Solicitacoes de emprestimo, no painel (so administrador).
+app.use("/api/requests", requestRoutes);
 app.use("/api/people", peopleRoutes);
 app.use("/api/admins", adminRoutes);
 // O recorte de fundo atende as duas sessoes, no mesmo router: a de
@@ -227,6 +250,7 @@ app.use("/api/dev", devRoutes);
 // em cima, para toda a API.)
 app.use("/api/public/alerts", alertRoutes);
 app.use("/api/public/suggestions", publicSuggestions);
+app.use("/api/public/requests", publicRequests);
 // Livros sugeridos, no painel (so administrador).
 app.use("/api/suggestions", suggestionRoutes);
 app.use("/api/public", publicRoutes);
@@ -343,6 +367,15 @@ async function prepareDatabase() {
       what: "os avisos de devolução pendentes",
       async run() {
         retryPendingAlerts();
+      },
+    },
+    {
+      // Solicitacao que ficou no meio do "Realizar emprestimo" (servidor
+      // caiu): termina ou desfaz (ver routes/requests.js).
+      what: "as solicitações interrompidas",
+      async run() {
+        const fixed = await recoverStuckConversions({ olderThanMs: 10 * 1000 });
+        if (fixed) console.log(fixed + " solicitação(ões) interrompida(s) acertada(s).");
       },
     },
     {

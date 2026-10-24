@@ -4,6 +4,7 @@ import Book, {
   normalizeText,
 } from "../models/Book.js";
 import Loan from "../models/Loan.js";
+import LoanRequest from "../models/LoanRequest.js";
 import { requireAdmin } from "../middleware/auth.js";
 import { lookupIsbn, searchCoverImages } from "../services/isbn.js";
 import { cleanCategoryList } from "../services/categories.js";
@@ -15,6 +16,13 @@ import {
 } from "../services/images.js";
 import { fetchRemoteImage } from "../services/remoteImage.js";
 import { announceAvailability } from "../services/returnAlerts.js";
+import {
+  availableOf,
+  NOTHING_OUT,
+  OCCUPYING_REQUEST,
+  occupancyByBook,
+} from "../services/occupancy.js";
+import { forgetPreviewImage } from "../services/requestPreview.js";
 
 const router = Router();
 router.use(requireAdmin);
@@ -69,33 +77,47 @@ async function prepareCategories(value) {
 // Acrescenta a cada livro a situação dos exemplares:
 // - copies: total de exemplares
 // - loanedCount / loanedNames: quantos estão emprestados agora e com quem
-// - available: quantos estão na estante
+// - requestedCount / requestedNames: quantos estão SOLICITADOS (retirada já
+//   combinada) e por quem - ver services/occupancy.js
+// - available: quantos estão na estante (livres para emprestar ou solicitar)
 async function withLoanInfo(books) {
-  const activeLoans = await Loan.find({
-    status: "ativo",
-    book: { $in: books.map((book) => book._id) },
-  })
-    .select("book personName")
-    .sort({ startDate: 1 })
-    .lean();
-
-  const namesByBook = new Map();
-  activeLoans.forEach((loan) => {
-    const key = String(loan.book);
-    namesByBook.set(key, [...(namesByBook.get(key) || []), loan.personName]);
-  });
-
+  const outByBook = await occupancyByBook(books.map((book) => book._id));
   return books.map((book) => {
-    const loanedNames = namesByBook.get(String(book._id)) || [];
-    const copies = book.copies || 1;
+    const out = outByBook.get(String(book._id)) || NOTHING_OUT;
     return {
       ...book,
-      copies,
-      loanedCount: loanedNames.length,
-      loanedNames,
-      available: Math.max(0, copies - loanedNames.length),
+      copies: book.copies || 1,
+      loanedCount: out.loaned,
+      loanedNames: out.loanedNames,
+      requestedCount: out.requested,
+      requestedNames: out.requestedNames,
+      available: availableOf(book, out),
     };
   });
+}
+
+// Filtro por situacao do painel (?status=):
+// - disponivel: tem exemplar livre na estante;
+// - emprestado: tem PELO MENOS UM exemplar emprestado;
+// - solicitado: tem PELO MENOS UMA solicitacao registrada.
+// (O acervo publico conta diferente: la "emprestado" e "solicitado" sao os
+// livros sem nenhum exemplar livre - ver routes/public.js.)
+async function statusClause(status) {
+  if (!["disponivel", "emprestado", "solicitado"].includes(status)) return null;
+  const out = await occupancyByBook();
+  const ids = [...out.keys()];
+  if (status === "emprestado") {
+    return { $in: ids.filter((id) => out.get(id).loaned > 0) };
+  }
+  if (status === "solicitado") {
+    return { $in: ids.filter((id) => out.get(id).requested > 0) };
+  }
+  // Disponivel: fora da lista os livros com TODOS os exemplares ocupados.
+  const books = await Book.find({ _id: { $in: ids } }).select("copies").lean();
+  const full = books
+    .filter((book) => availableOf(book, out.get(String(book._id))) === 0)
+    .map((book) => book._id);
+  return { $nin: full };
 }
 
 // GET /api/books?search=texto&page=1&limit=10
@@ -117,6 +139,9 @@ router.get("/", async (req, res, next) => {
     // Filtro por categoria (nome exato, como listado em /categories).
     const category = String(req.query.category || "").trim();
     if (category) filter.categories = category;
+
+    const byStatus = await statusClause(String(req.query.status || ""));
+    if (byStatus) filter._id = byStatus;
 
     if (search) {
       const regex = new RegExp(
@@ -372,26 +397,36 @@ router.put("/:id", async (req, res, next) => {
     }
 
     // Exemplares: inteiro de 1 a 999 e nunca menos do que os que estao
-    // emprestados agora (senao haveria mais emprestimos que exemplares).
+    // fora agora - emprestados ou solicitados (senao haveria mais gente com o
+    // livro do que exemplares).
     if ("copies" in payload) {
       const copies = parseCopies(payload.copies);
       if (copies === null) {
         return res.status(400).json({ error: COPIES_ERROR });
       }
-      const loanedNow = await Loan.countDocuments({
-        book: previous._id,
-        status: "ativo",
-      });
-      if (copies < loanedNow) {
+      const out =
+        (await occupancyByBook([previous._id])).get(String(previous._id)) ||
+        NOTHING_OUT;
+      const outNow = out.loaned + out.requested;
+      if (copies < outNow) {
+        const what = !out.requested
+          ? outNow === 1
+            ? "emprestado"
+            : "emprestados"
+          : !out.loaned
+            ? outNow === 1
+              ? "solicitado"
+              : "solicitados"
+            : "fora (emprestados ou solicitados)";
         return res.status(409).json({
           error:
-            loanedNow === 1
-              ? "Há 1 emprestado agora, então a quantidade não pode ser menor que 1."
-              : "Há " +
-                loanedNow +
-                " emprestados agora, então a quantidade não pode ser menor que " +
-                loanedNow +
-                ".",
+            "Há " +
+            outNow +
+            " " +
+            what +
+            " agora, então a quantidade não pode ser menor que " +
+            outNow +
+            ".",
         });
       }
       payload.copies = copies;
@@ -439,16 +474,24 @@ router.put("/:id", async (req, res, next) => {
       announceAvailability(book._id);
     }
 
-    // Mantem os cards de emprestimo ativos com o titulo/capa atualizados.
-    await Loan.updateMany(
-      { book: book._id, status: "ativo" },
-      {
-        bookTitle: book.title,
-        bookTitleSort: normalizeText(book.title),
-        bookCover: book.cover,
-        bookIsbn: book.isbn,
-      },
-    );
+    // Mantem os cards de emprestimo ativos (e as solicitacoes) com o
+    // titulo/capa atualizados.
+    const bookCopy = {
+      bookTitle: book.title,
+      bookTitleSort: normalizeText(book.title),
+      bookCover: book.cover,
+      bookIsbn: book.isbn,
+    };
+    await Promise.all([
+      Loan.updateMany({ book: book._id, status: "ativo" }, bookCopy),
+      LoanRequest.updateMany({ book: book._id }, bookCopy),
+    ]);
+
+    // A capa mudou: a copia dela feita para a previa do link do WhatsApp
+    // (ver services/requestPreview.js) ficou velha.
+    if ((previous.cover || "") !== (book.cover || "")) {
+      await forgetPreviewImage(previous);
+    }
 
     // A foto antiga ficou sem uso: apaga no Cloudinary e, nos emprestimos ja
     // devolvidos (que ainda ficam alguns dias no historico), troca a capa
@@ -499,8 +542,35 @@ router.delete("/:id", async (req, res, next) => {
       });
     }
 
+    // Solicitacao registrada segura um exemplar para alguem: primeiro ela
+    // vira emprestimo ou e excluida (em Emprestimos > Solicitados).
+    const requests = await LoanRequest.find({
+      book: req.params.id,
+      status: { $in: OCCUPYING_REQUEST },
+    })
+      .select("personName")
+      .lean();
+    if (requests.length) {
+      return res.status(409).json({
+        error:
+          (requests.length === 1
+            ? "Esse livro está solicitado por " + requests[0].personName
+            : "Esse livro tem " +
+              requests.length +
+              " solicitações (" +
+              requests.map((item) => item.personName).join(", ") +
+              ")") +
+          ". Exclua a solicitação (em Empréstimos > Solicitados) antes de excluir o livro.",
+      });
+    }
+
     const book = await Book.findByIdAndDelete(req.params.id);
     if (!book) return res.status(404).json({ error: "Livro não encontrado." });
+
+    // Links de WhatsApp ainda nao usados deste livro nao tem mais o que abrir,
+    // e a copia da capa feita para a previa deles tambem nao serve mais.
+    await LoanRequest.deleteMany({ book: book._id, status: "pendente" });
+    await forgetPreviewImage(book);
 
     // Libera espaco no Cloudinary. Se falhar, o livro continua excluido (o
     // banco manda) e o erro fica registrado no log do servidor.

@@ -1,6 +1,8 @@
 import { Router } from "express";
 import Person from "../models/Person.js";
 import Loan from "../models/Loan.js";
+import LoanRequest from "../models/LoanRequest.js";
+import { OCCUPYING_REQUEST } from "../services/occupancy.js";
 import { normalizeText } from "../models/Book.js";
 import { requireAdmin } from "../middleware/auth.js";
 import {
@@ -280,6 +282,24 @@ router.delete("/:id", async (req, res, next) => {
           " está com " +
           openLoans.map((loan) => loan.bookTitle).join(", ") +
           ". Confirme a devolução antes de excluir.",
+      });
+    }
+
+    // Solicitacao registrada segura um exemplar para esta pessoa: ela vira
+    // emprestimo ou e excluida antes (em Emprestimos > Solicitados).
+    const openRequests = await LoanRequest.find({
+      person: person._id,
+      status: { $in: OCCUPYING_REQUEST },
+    })
+      .select("bookTitle")
+      .lean();
+    if (openRequests.length) {
+      return res.status(409).json({
+        error:
+          person.fullName +
+          " tem solicitação de " +
+          openRequests.map((item) => item.bookTitle).join(", ") +
+          ". Exclua a solicitação (em Empréstimos > Solicitados) antes de remover a pessoa.",
       });
     }
 

@@ -3,10 +3,10 @@ import Book, {
   mostLoanedBookId,
   normalizeText,
 } from "../models/Book.js";
-import Loan from "../models/Loan.js";
 import Person from "../models/Person.js";
 import { MAX_CATEGORY_LENGTH } from "../services/categories.js";
 import { IS_ADMIN_FILTER } from "../services/people.js";
+import { availableOf, occupancyByBook } from "../services/occupancy.js";
 
 /**
  * Rotas PUBLICAS (sem login) do acervo. Alimentam a pagina /catalogo, que e
@@ -23,7 +23,8 @@ import { IS_ADMIN_FILTER } from "../services/people.js";
  *   de entrega (a previsao de devolucao que o acervo mostra). Nome, telefone,
  *   data de retirada e observacoes nunca entram em nenhuma resposta deste
  *   arquivo: a data diz QUANDO o livro volta para a estante, nunca com quem
- *   ele esta.
+ *   ele esta. Das solicitacoes registradas (ver models/LoanRequest.js) sai so
+ *   a CONTAGEM - nem quem pediu, nem o dia combinado.
  */
 const router = Router();
 
@@ -99,51 +100,44 @@ function searchClause(term) {
   return { $or: clauses };
 }
 
-// O que cada livro tem emprestado agora: Map(id -> { count, nextDue }).
-//  - count: quantas unidades estao fora da estante;
-//  - nextDue: a data combinada de entrega mais proxima entre elas.
-// So isso: nenhum dado de quem pegou o livro passa por aqui.
+// O que cada livro tem fora da estante agora: Map(id -> { loaned, nextDue,
+// requested, ... }) - ver services/occupancy.js. O Map tambem traz os nomes
+// (servem ao painel): daqui so as contagens e a data seguem adiante.
 async function activeLoanInfo() {
-  const rows = await Loan.aggregate([
-    { $match: { status: "ativo" } },
-    {
-      $group: {
-        _id: "$book",
-        count: { $sum: 1 },
-        // O $min ignora emprestimo sem prazo: com dois exemplares fora, um com
-        // data combinada e outro sem, vale a data que existe.
-        nextDue: { $min: "$dueDate" },
-      },
-    },
-  ]);
-  return new Map(
-    rows.map((row) => [
-      String(row._id),
-      { count: row.count, nextDue: row.nextDue || null },
-    ]),
-  );
+  return occupancyByBook();
 }
 
-// Ids dos livros sem nenhuma unidade na estante (todas emprestadas). So olha
-// livros que tem emprestimo ativo, entao a lista e pequena mesmo com acervo
-// grande.
-async function fullyLoanedIds(loans) {
-  if (!loans.size) return [];
+// Ids dos livros por situacao, olhando so os que tem algo fora (a lista e
+// pequena mesmo com acervo grande):
+// - full: sem nenhum exemplar na estante (todos emprestados ou solicitados);
+// - loaned: sem exemplar na estante e com algum emprestado;
+// - requested: sem exemplar na estante e com algum solicitado.
+// (Um livro de 2 exemplares, um emprestado e um solicitado, esta nos dois.)
+async function unavailableIds(loans) {
+  if (!loans.size) return { full: [], loaned: [], requested: [] };
   const books = await Book.find({ _id: { $in: [...loans.keys()] } })
     .select("copies")
     .lean();
-  return books
-    .filter(
-      (book) => loans.get(String(book._id)).count >= (book.copies || 1),
-    )
-    .map((book) => book._id);
+  const full = books.filter(
+    (book) => availableOf(book, loans.get(String(book._id))) === 0,
+  );
+  return {
+    full: full.map((book) => book._id),
+    loaned: full
+      .filter((book) => loans.get(String(book._id)).loaned > 0)
+      .map((book) => book._id),
+    requested: full
+      .filter((book) => loans.get(String(book._id)).requested > 0)
+      .map((book) => book._id),
+  };
 }
 
 // Monta a resposta publica de um livro. Campo novo no livro so aparece aqui se
 // for acrescentado de proposito, aos dois lugares (PUBLIC_BOOK_FIELDS e aqui).
 function toPublicBook(book, loans = null) {
   const copies = book.copies || 1;
-  const loaned = Math.min(loans?.count || 0, copies);
+  const loaned = Math.min(loans?.loaned || 0, copies);
+  const requested = Math.min(loans?.requested || 0, copies - loaned);
   return {
     id: String(book._id),
     title: book.title,
@@ -157,7 +151,10 @@ function toPublicBook(book, loans = null) {
     categories: book.categories || [],
     copies,
     loaned,
-    available: copies - loaned,
+    // Exemplares SOLICITADOS: a retirada ja foi combinada com alguem, entao
+    // nao estao livres. So a contagem.
+    requested,
+    available: copies - loaned - requested,
     // PREVISAO DE ENTREGA: a data combinada para o exemplar emprestado voltar
     // para a estante. Com mais de um exemplar fora, e a mais proxima entre as
     // datas combinadas. null quando nada esta emprestado ou quando o
@@ -191,14 +188,14 @@ async function libraryStaff() {
 // GET /api/public/overview
 // Totais do acervo e categorias (alimenta o filtro e o resumo da tela).
 //  - available: livros com pelo menos uma unidade na estante
-//  - unavailable: livros com TODAS as unidades emprestadas
+//  - unavailable: livros com TODAS as unidades fora (emprestadas ou solicitadas)
 router.get("/overview", async (req, res, next) => {
   try {
     const loans = await activeLoanInfo();
     const [titles, outIds, categoryRows, staff] =
       await Promise.all([
         Book.countDocuments(),
-        fullyLoanedIds(loans),
+        unavailableIds(loans).then((ids) => ids.full),
         Book.aggregate([
           { $unwind: "$categories" },
           { $match: { categories: { $ne: "" } } },
@@ -227,8 +224,9 @@ router.get("/overview", async (req, res, next) => {
 // GET /api/public/books?search=texto&category=Oração&status=disponivel&page=1&limit=10
 // - search: titulo, autor ou ISBN
 // - category: nome exato da categoria (como listado em /overview)
-// - status: "disponivel" (tem unidade na estante) ou "emprestado" (todas as
-//   unidades emprestadas). Qualquer outro valor = todos.
+// - status: "disponivel" (tem unidade na estante), "emprestado" (nenhuma na
+//   estante, alguma emprestada) ou "solicitado" (nenhuma na estante, alguma
+//   solicitada). Qualquer outro valor = todos.
 // - since: so livros cadastrados DEPOIS desta data/hora (ISO). Alimenta a
 //   tela de novidades (/catalogo/novidades) - "desde a ultima visita" quem
 //   decide e o front, comparando com o que guardou no localStorage.
@@ -268,11 +266,16 @@ router.get("/books", async (req, res, next) => {
     // So o filtro por situacao precisa da contagem de emprestimos ANTES de
     // consultar os livros. Sem ele, as consultas vao juntas ao banco (cada
     // ida e volta ao banco custa tempo; em fila, a resposta demora o triplo).
-    const filtersByStatus = status === "disponivel" || status === "emprestado";
+    const filtersByStatus = ["disponivel", "emprestado", "solicitado"].includes(
+      status,
+    );
     const loansPromise = activeLoanInfo();
     if (filtersByStatus) {
-      const outIds = await fullyLoanedIds(await loansPromise);
-      filter._id = status === "emprestado" ? { $in: outIds } : { $nin: outIds };
+      const ids = await unavailableIds(await loansPromise);
+      filter._id =
+        status === "disponivel"
+          ? { $nin: ids.full }
+          : { $in: status === "emprestado" ? ids.loaned : ids.requested };
     }
 
     // O _id no fim da ordenacao desempata titulos iguais: sem ele, o mesmo

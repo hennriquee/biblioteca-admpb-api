@@ -18,6 +18,12 @@ const bookSchema = new mongoose.Schema(
     // pelo app (camera/galeria); capas vindas de link externo ficam vazias aqui.
     // E por ele que apagamos a foto la quando o livro e excluido ou trocado.
     coverPublicId: { type: String, default: '' },
+    // Copia da capa feita no Cloudinary SO para a previa do link de
+    // solicitacao no WhatsApp (ver services/requestPreview.js), quando a capa
+    // e um link de outro site. ogImageSource diz de qual capa ela foi feita:
+    // trocou a capa, a copia e refeita.
+    ogImagePublicId: { type: String, default: '' },
+    ogImageSource: { type: String, default: '' },
     synopsis: { type: String, default: '' },
     categories: { type: [String], default: [] },
     copies: { type: Number, default: 1, min: 1 },

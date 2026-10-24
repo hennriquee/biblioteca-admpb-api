@@ -49,7 +49,21 @@ export const SUGGESTION_PHOTO = {
   label: "a foto do livro",
 };
 
-const FOLDERS = [BOOK_COVER.folder, PROFILE_PHOTO.folder, SUGGESTION_PHOTO.folder];
+// Copia da capa (quando ela e link de outro site) para a previa do link de
+// solicitacao no WhatsApp - ver services/requestPreview.js. Uma por livro.
+export const PREVIEW_IMAGE = {
+  folder: "biblioteca-admpb/previas",
+  width: 800,
+  height: 1200,
+  label: "a capa da prévia",
+};
+
+const FOLDERS = [
+  BOOK_COVER.folder,
+  PROFILE_PHOTO.folder,
+  SUGGESTION_PHOTO.folder,
+  PREVIEW_IMAGE.folder,
+];
 
 // Limite do arquivo ja decodificado. O front manda ~150 KB (capa), ~60 KB
 // (perfil com fundo) ou ate algumas centenas de KB (perfil recortado, que e
@@ -69,7 +83,7 @@ export function isCloudinaryConfigured() {
   );
 }
 
-function ensureConfigured() {
+export function ensureConfigured() {
   if (!isCloudinaryConfigured()) {
     const error = new Error(
       "O envio de fotos não está configurado no servidor (faltam as variáveis do Cloudinary).",
@@ -191,3 +205,5 @@ export async function deleteImage(publicId) {
     return false;
   }
 }
+
+export { cloudinary };

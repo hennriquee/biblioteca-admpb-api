@@ -4,7 +4,13 @@ import Book, { normalizeText } from "../models/Book.js";
 import Person from "../models/Person.js";
 import { requireAdmin } from "../middleware/auth.js";
 import { normalizePhone, PHONE_ERROR } from "../services/phone.js";
-import { syncActiveLoans, withAdminFlag } from "../services/people.js";
+import { withAdminFlag } from "../services/people.js";
+import { noFreeCopyMessage } from "../services/occupancy.js";
+import {
+  activeLoanWarning,
+  readLoanDates,
+  recordLoan,
+} from "../services/loans.js";
 import { announceAvailability } from "../services/returnAlerts.js";
 
 const router = Router();
@@ -72,49 +78,16 @@ router.post("/", async (req, res, next) => {
         error: "Selecione a pessoa cadastrada antes de registrar o empréstimo.",
       });
     }
-    if (!startDate)
-      return res.status(400).json({ error: "Informe a data de retirada." });
-
-    // As datas sao conferidas AQUI, nao so na tela: a tela e uma das formas de
-    // chamar a API, e um prazo antes da retirada faria a barra de progresso
-    // contar um tempo negativo.
-    const start = new Date(startDate);
-    if (Number.isNaN(start.getTime())) {
-      return res.status(400).json({ error: "A data de retirada não é válida." });
-    }
-    let due = null;
-    if (dueDate) {
-      due = new Date(dueDate);
-      if (Number.isNaN(due.getTime())) {
-        return res
-          .status(400)
-          .json({ error: "A data de devolução não é válida." });
-      }
-      if (due < start) {
-        return res.status(400).json({
-          error: "A data de devolução não pode ser anterior à da retirada.",
-        });
-      }
-    }
+    const { start, due } = readLoanDates(startDate, dueDate);
 
     const book = await Book.findById(bookId);
     if (!book) return res.status(404).json({ error: "Livro não encontrado." });
 
     // Emprestimo so e permitido enquanto sobrar algum exemplar na estante.
-    const copies = book.copies || 1;
-    const bookLoans = await Loan.find({ book: book._id, status: "ativo" })
-      .select("personName")
-      .lean();
-    if (bookLoans.length >= copies) {
-      return res.status(409).json({
-        error:
-          copies === 1
-            ? "Esse livro já está com " + bookLoans[0].personName + "."
-            : "Todas as " +
-              copies +
-              " unidades desse livro já estão emprestadas.",
-      });
-    }
+    // Exemplar SOLICITADO nao esta na estante: ele so sai pela propria
+    // solicitacao, para a pessoa que pediu (ver routes/requests.js).
+    const busy = await noFreeCopyMessage(book);
+    if (busy) return res.status(409).json({ error: busy });
 
     // QUEM esta levando o livro: sempre a pessoa escolhida na lista de
     // sugestoes (personId) - o cadastro dela e a identidade, nunca um nome
@@ -124,65 +97,19 @@ router.post("/", async (req, res, next) => {
       return res.status(404).json({ error: "Pessoa não encontrada." });
     }
 
-    const openLoans = await Loan.find({ person: person._id, status: "ativo" })
-      .select("bookTitle")
-      .lean();
     // O front pergunta "tem certeza?" e reenvia com force = true.
-    if (openLoans.length > 0 && !force) {
-      return res.status(409).json({
-        code: "PERSON_HAS_ACTIVE_LOAN",
-        error:
-          person.fullName +
-          " já está com " +
-          openLoans.map((l) => l.bookTitle).join(", ") +
-          ".",
-        activeLoans: openLoans,
-      });
-    }
+    const warning = force ? null : await activeLoanWarning(person);
+    if (warning) return res.status(409).json(warning);
 
-    // Trocou de numero: o cadastro da pessoa passa a valer com o novo, e os
-    // emprestimos que ela ja tem em andamento tambem (o aviso de devolucao
-    // precisa ir para o numero certo).
-    const phoneChanged = Boolean(phone) && person.phone !== phone;
-    if (phoneChanged) person.phone = phone;
-
-    const loan = await Loan.create({
-      book: book._id,
-      person: person._id,
-      bookTitle: book.title,
-      bookCover: book.cover,
-      bookIsbn: book.isbn,
-      bookTitleSort: normalizeText(book.title),
-      personName: person.fullName,
-      personNameSort: normalizeText(person.fullName),
-      personCode: person.code || null,
-      personPhone: person.phone || "",
-      // QUEM APROVOU: o administrador que esta registrando o emprestimo. Sai
-      // da sessao (req.account), nunca do que o app mandou - ninguem assina
-      // um emprestimo no lugar de outra pessoa.
-      approvedBy: req.account._id,
-      approvedByName: req.account.fullName,
-      startDate: start,
-      dueDate: due,
-      notes: notes || "",
-      status: "ativo",
+    const loan = await recordLoan({
+      book,
+      person,
+      account: req.account,
+      start,
+      due,
+      notes,
+      phone,
     });
-
-    // Os dois contadores sobem com $inc, que soma no proprio banco: dois
-    // emprestimos ao mesmo tempo nao se atropelam, como aconteceria lendo o
-    // numero e gravando de volta. O numero novo de WhatsApp, quando ha, e
-    // gravado na mesma ida ao banco.
-    await Promise.all([
-      Person.updateOne(
-        { _id: person._id },
-        {
-          $inc: { loansCount: 1 },
-          ...(phoneChanged ? { $set: { phone: person.phone } } : {}),
-        },
-      ),
-      Book.updateOne({ _id: book._id }, { $inc: { loansTotal: 1 } }),
-    ]);
-    if (phoneChanged) await syncActiveLoans(person);
 
     return res.status(201).json(await withAdminFlag(loan.toObject()));
   } catch (error) {

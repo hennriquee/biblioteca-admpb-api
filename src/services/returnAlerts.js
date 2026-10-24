@@ -18,7 +18,7 @@
  */
 import webpush from "web-push";
 import Book from "../models/Book.js";
-import Loan from "../models/Loan.js";
+import { occupiedCount } from "./occupancy.js";
 import ReturnAlert from "../models/ReturnAlert.js";
 import Setting from "../models/Setting.js";
 
@@ -198,14 +198,15 @@ export function readTitle(value) {
 // ---------- Situacao do livro ----------
 
 /**
- * Livro com TODOS os exemplares emprestados agora? Devolve o livro ({ _id,
- * title, copies }) com `fullyLoaned`, ou null se ele nao existe.
+ * Livro com TODOS os exemplares fora agora (emprestados ou solicitados - ver
+ * services/occupancy.js)? Devolve o livro ({ _id, title, copies }) com
+ * `fullyLoaned`, ou null se ele nao existe.
  */
 export async function bookAvailability(bookId) {
   const book = await Book.findById(bookId).select("title copies").lean();
   if (!book) return null;
-  const loaned = await Loan.countDocuments({ book: book._id, status: "ativo" });
-  return { ...book, fullyLoaned: loaned >= (book.copies || 1) };
+  const out = await occupiedCount(book._id);
+  return { ...book, fullyLoaned: out >= (book.copies || 1) };
 }
 
 // ---------- Envio ----------
