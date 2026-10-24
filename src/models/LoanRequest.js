@@ -48,6 +48,11 @@ const loanRequestSchema = new mongoose.Schema(
     // cadastro: e o administrador quem escolhe a ficha certa).
     requesterName: { type: String, default: '' },
     requesterNameSort: { type: String, default: '' },
+    // No acervo publico a pessoa pode tocar no proprio nome (busca no
+    // cadastro) ou dizer "Nao sou nenhuma dessas pessoas" (novo cadastro).
+    // So uma indicacao: quem confirma a ficha e o administrador.
+    requesterPerson: { type: mongoose.Schema.Types.ObjectId, ref: 'Person', default: null },
+    requesterIsNew: { type: Boolean, default: false },
 
     // RETIRADA PREVISTA: o dia combinado (ou, ainda pendente, o dia de
     // preferencia que a pessoa escolheu).

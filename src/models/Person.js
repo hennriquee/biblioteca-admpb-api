@@ -56,6 +56,12 @@ const personSchema = new mongoose.Schema(
     username: { type: String, default: null, trim: true, lowercase: true },
     // Nunca guardamos a senha em texto puro, apenas o hash dela.
     passwordHash: { type: String, default: null },
+
+    // Sininho do painel (ver routes/notifications.js): ate quando ESTE
+    // administrador ja viu os livros sugeridos (a data de cadastro da
+    // sugestao mais nova que estava na tela dele). As mais novas que isso
+    // contam na bolinha vermelha. null = nunca abriu a tela: todas contam.
+    suggestionsSeenAt: { type: Date, default: null },
   },
   { timestamps: true }
 );

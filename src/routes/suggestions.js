@@ -2,6 +2,7 @@ import { Router } from "express";
 import crypto from "node:crypto";
 import rateLimit from "express-rate-limit";
 import BookSuggestion from "../models/BookSuggestion.js";
+import Person from "../models/Person.js";
 import SuggestionThrottle from "../models/SuggestionThrottle.js";
 import SuggestionQuota from "../models/SuggestionQuota.js";
 import { normalizeText } from "../models/Book.js";
@@ -369,6 +370,33 @@ router.get("/", async (req, res, next) => {
       .limit(MAX_STORED)
       .lean();
     return res.json(items.map(publicItem));
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// POST /api/suggestions/seen  { upTo }
+// O administrador abriu a tela de sugestoes: as que chegaram ate "upTo" (a
+// data de cadastro da mais nova que estava na tela dele) saem da contagem do
+// sininho, so para ESTA conta (ver routes/notifications.js). Uma que chegue
+// depois de a tela carregar continua contando. A marca so anda para frente.
+router.post("/seen", async (req, res, next) => {
+  try {
+    const upTo = new Date(req.body?.upTo);
+    if (typeof req.body?.upTo !== "string" || Number.isNaN(upTo.getTime())) {
+      return res.status(400).json({ error: "Data inválida." });
+    }
+    // Relogio adiantado no aparelho nao marca como vista uma que ainda vai chegar.
+    const mark = upTo.getTime() > Date.now() ? new Date() : upTo;
+    await Person.updateOne(
+      {
+        _id: req.user.id,
+        $or: [{ suggestionsSeenAt: null }, { suggestionsSeenAt: { $lt: mark } }],
+      },
+      { $set: { suggestionsSeenAt: mark } },
+      { timestamps: false },
+    );
+    return res.json({ ok: true });
   } catch (error) {
     return next(error);
   }

@@ -14,6 +14,7 @@ import suggestionRoutes, { publicSuggestions } from "./src/routes/suggestions.js
 import adminRoutes from "./src/routes/admins.js";
 import photoRoutes from "./src/routes/photos.js";
 import devRoutes from "./src/routes/dev.js";
+import notificationRoutes from "./src/routes/notifications.js";
 import captchaRoutes from "./src/routes/captcha.js";
 import requestRoutes, {
   ogPreviewHandler,
@@ -253,6 +254,8 @@ app.use("/api/public/suggestions", publicSuggestions);
 app.use("/api/public/requests", publicRequests);
 // Livros sugeridos, no painel (so administrador).
 app.use("/api/suggestions", suggestionRoutes);
+// Sininho do painel: solicitacoes e sugestoes novas (so administrador).
+app.use("/api/notifications", notificationRoutes);
 app.use("/api/public", publicRoutes);
 
 // Rota nao encontrada

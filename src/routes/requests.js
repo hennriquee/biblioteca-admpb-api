@@ -130,6 +130,27 @@ async function withSituation(book) {
   };
 }
 
+// A ficha de uma pessoa como o painel a mostra nas listas de escolha
+// (mesmo formato de GET /api/people), ou null.
+async function personCard(personId) {
+  if (!personId) return null;
+  const person = await Person.findById(personId).lean();
+  if (!person) return null;
+  const loans = await Loan.find({ person: person._id, status: "ativo" })
+    .select("bookTitle")
+    .lean();
+  return {
+    _id: person._id,
+    code: person.code || null,
+    fullName: person.fullName,
+    phone: person.phone || "",
+    photo: person.photo || "",
+    loansCount: person.loansCount || 0,
+    isAdmin: Boolean(person.username),
+    activeLoans: loans.map((loan) => loan.bookTitle),
+  };
+}
+
 // O que sai sobre uma solicitacao: o token do link nunca sai do servidor
 // depois de criado (quem tem o link ja o conhece).
 function toRequest(request) {
@@ -168,8 +189,140 @@ const passLimiter = rateLimit({
   },
 });
 
-// POST /api/public/requests  { bookId, name, pickupDate, website }
-// -> 201 { token, pickupDate } (200 quando o mesmo pedido e repetido).
+// Busca de nomes do "Solicitar empréstimo": folgada para quem digita (cada
+// letra pode virar uma busca), mas sem deixar varrer o cadastro.
+// (Por rede o teto e alto: no domingo a igreja inteira digita nome no mesmo
+// Wi-Fi, e cada nome vira umas 3 a 6 buscas. Quem segura varredura e o
+// limite por passe e as regras da busca.)
+const searchLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 1000,
+  keyGenerator: (req) => "busca-nome:" + networkOf(req.ip),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas buscas em pouco tempo. Aguarde alguns minutos." },
+});
+const searchPassLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 80,
+  keyGenerator: (req) => "busca-nome-passe:" + (req.sitePassId || "nenhum"),
+  skip: (req) => !req.sitePassId,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitas buscas em pouco tempo. Aguarde alguns minutos." },
+});
+
+const MAX_NAME_RESULTS = 5;
+// A escolha "sou eu" vai ao servidor como uma referencia CIFRADA (ref), e
+// nao como o id do banco: o id nao sai da API publica (ele revela a data do
+// cadastro) e a ref nao pode ser forjada nem lida - e AES-256-GCM, com chave
+// derivada do JWT_SECRET, e vale 2 horas.
+const PERSON_REF_MS = 2 * 60 * 60 * 1000;
+
+function personRefKey() {
+  return crypto
+    .createHmac("sha256", process.env.JWT_SECRET)
+    .update("ficha-da-busca-de-nomes")
+    .digest();
+}
+
+function personRef(personId) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", personRefKey(), iv);
+  const plain = Buffer.from(String(personId) + "." + (Date.now() + PERSON_REF_MS));
+  const sealed = Buffer.concat([cipher.update(plain), cipher.final()]);
+  return Buffer.concat([iv, cipher.getAuthTag(), sealed]).toString("base64url");
+}
+
+// O id da ficha dentro da ref, ou null (ref falsa, adulterada ou vencida).
+function readPersonRef(ref) {
+  if (typeof ref !== "string" || ref.length > 200) return null;
+  try {
+    const raw = Buffer.from(ref, "base64url");
+    if (raw.length < 29) return null;
+    const decipher = crypto.createDecipheriv("aes-256-gcm", personRefKey(), raw.subarray(0, 12));
+    decipher.setAuthTag(raw.subarray(12, 28));
+    const plain = Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString();
+    const [id, until] = plain.split(".");
+    if (!(Number(until) > Date.now())) return null;
+    return readId(id);
+  } catch {
+    return null;
+  }
+}
+
+// Palavras do nome digitado, sem acento e sem pontuacao. (O nome no cadastro
+// guarda hifen e apostrofo - "ana-maria", "d'avila" -; por isso a busca aceita
+// essas marcas como comeco de palavra, abaixo.)
+function nameWords(value) {
+  return normalizeText(cleanText(value).slice(0, 80))
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+/**
+ * GET /api/public/requests/people?name=Maria Nog -> { people: [{ id, name,
+ * hint }] }
+ *
+ * "E voce?": quem esta pedindo um livro toca no proprio nome. O cadastro e de
+ * gente da igreja, entao a busca e apertada de proposito:
+ * - so procura com NOME E COMECO DO SOBRENOME digitados: duas palavras ou
+ *   mais, a primeira com 3 letras ou mais e alguma outra com 2 ou mais -
+ *   "Jo" ou "Maria S" nao listam ninguem;
+ * - o primeiro nome tem de bater com o COMECO do nome cadastrado, e cada
+ *   outra palavra com o comeco de alguma palavra do nome;
+ * - no maximo 5 resultados;
+ * - sai so o nome e, para separar dois nomes iguais, os 2 ultimos digitos do
+ *   WhatsApp. Nada de foto, numero (#), telefone inteiro, livros nem o id do
+ *   banco (vai uma "ref" cifrada, que vale 2 horas - ver personRef).
+ */
+publicRequests.get("/people", searchLimiter, searchPassLimiter, async (req, res, next) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    const words = nameWords(typeof req.query.name === "string" ? req.query.name : "");
+    if (
+      words.length < 2 ||
+      words[0].length < 3 ||
+      !words.slice(1).some((word) => word.length >= 2)
+    ) {
+      return res.json({ people: [] });
+    }
+
+    const escape = (word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Comeco de palavra: inicio, espaco, hifen, apostrofo ou ponto.
+    const clauses = [
+      { nameSort: new RegExp("^" + escape(words[0])) },
+      ...words.slice(1).map((word) => ({
+        nameSort: new RegExp("(^|[\\s'\u2019.-])" + escape(word)),
+      })),
+    ];
+    const people = await Person.find({ $and: clauses })
+      .select("fullName phone")
+      .sort({ nameSort: 1, _id: 1 })
+      .limit(MAX_NAME_RESULTS)
+      .lean();
+
+    return res.json({
+      people: people.map((person) => ({
+        ref: personRef(person._id),
+        name: person.fullName,
+        hint:
+          person.phone && person.phone.length >= 4
+            ? "WhatsApp terminado em " + person.phone.slice(-2)
+            : "",
+      })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// POST /api/public/requests  { bookId, name, pickupDate, website, personRef?,
+// newPerson? } -> 201 { token, pickupDate, name } (200 quando o mesmo pedido
+// e repetido). personRef: a pessoa tocou no proprio nome na busca (o nome que
+// vale e o do cadastro); newPerson: tocou em "Nao sou nenhuma dessas pessoas".
 publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
   try {
     const body = req.body || {};
@@ -179,12 +332,28 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
     const bookId = readId(body.bookId);
     if (!bookId) return res.status(400).json({ error: "Esse livro não existe." });
 
-    const name = cleanPersonName(cleanText(body.name));
+    // Escolheu o proprio nome na busca: vale o nome do cadastro.
+    let chosen = null;
+    if (body.personRef !== undefined && body.personRef !== null && body.personRef !== "") {
+      const personId = readPersonRef(body.personRef);
+      chosen = personId
+        ? await Person.findById(personId).select("fullName").lean()
+        : null;
+      if (!chosen) {
+        return res.status(409).json({
+          code: "PERSON_GONE",
+          error: "Não conseguimos confirmar o seu nome no cadastro. Toque nele de novo na lista.",
+        });
+      }
+    }
+    const requesterIsNew = !chosen && body.newPerson === true;
+
+    const name = chosen ? chosen.fullName : cleanPersonName(cleanText(body.name));
     if (!name) return res.status(400).json({ error: "Digite o seu nome completo." });
-    if (LINK.test(name) || !/\p{L}/u.test(name)) {
+    if (!chosen && (LINK.test(name) || !/\p{L}/u.test(name))) {
       return res.status(400).json({ error: "Digite só o seu nome completo." });
     }
-    if (!isFullName(name)) return res.status(400).json({ error: NAME_ERROR });
+    if (!chosen && !isFullName(name)) return res.status(400).json({ error: NAME_ERROR });
 
     const today = todayInBrazil();
     const last = addDays(today, MAX_PICKUP_DAYS_AHEAD);
@@ -226,12 +395,20 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
         requesterNameSort: nameKey,
         createdAt: { $gt: new Date(Date.now() - DAY_MS) },
       },
-      { $set: { pickupDate: day.date, linkExpiresAt, requesterName: name } },
+      {
+        $set: {
+          pickupDate: day.date,
+          linkExpiresAt,
+          requesterName: name,
+          requesterPerson: chosen ? chosen._id : null,
+          requesterIsNew,
+        },
+      },
       { new: true },
     );
     if (again) {
       preparePreview(book._id);
-      return res.json({ token: again.token, pickupDate: day.text });
+      return res.json({ token: again.token, pickupDate: day.text, name });
     }
 
     const createdToday = await LoanRequest.countDocuments({
@@ -252,6 +429,8 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
       token: newToken(),
       requesterName: name,
       requesterNameSort: nameKey,
+      requesterPerson: chosen ? chosen._id : null,
+      requesterIsNew,
       pickupDate: day.date,
       linkExpiresAt,
     });
@@ -260,7 +439,7 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
     // services/requestPreview.js): a resposta nao espera por ela.
     preparePreview(book._id);
 
-    return res.status(201).json({ token: request.token, pickupDate: day.text });
+    return res.status(201).json({ token: request.token, pickupDate: day.text, name });
   } catch (error) {
     return next(error);
   }
@@ -313,7 +492,21 @@ router.get("/", async (req, res, next) => {
     const requests = await LoanRequest.find({ status: { $in: OCCUPYING_REQUEST } })
       .sort({ pickupDate: 1, createdAt: 1, _id: 1 })
       .lean();
-    return res.json(await withAdminFlag(requests.map(toRequest)));
+    // A foto de quem vai levar (o painel mostra o rosto para conferir).
+    const people = await Person.find({
+      _id: { $in: requests.map((item) => item.person).filter(Boolean) },
+    })
+      .select("photo")
+      .lean();
+    const photoById = new Map(people.map((person) => [String(person._id), person.photo || ""]));
+    return res.json(
+      await withAdminFlag(
+        requests.map((item) => ({
+          ...toRequest(item),
+          personPhoto: photoById.get(String(item.person)) || "",
+        })),
+      ),
+    );
   } catch (error) {
     return next(error);
   }
@@ -352,6 +545,10 @@ router.get("/link/:token", async (req, res, next) => {
     return res.json({
       token,
       requesterName: request.requesterName,
+      // A ficha em que a pessoa tocou no acervo publico (ou null) e se ela
+      // disse que nao esta no cadastro.
+      requesterPerson: await personCard(request.requesterPerson),
+      requesterIsNew: Boolean(request.requesterIsNew),
       pickupDate: request.pickupDate,
       book: await withSituation(book),
     });
