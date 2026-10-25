@@ -27,6 +27,34 @@ export function cleanPersonName(value) {
     .slice(0, MAX_NAME_LENGTH);
 }
 
+// Ligacoes do nome ("Joao DA Silva"): nao contam como nome.
+const NAME_PARTICLES = new Set(["de", "da", "do", "das", "dos"]);
+
+// O PRIMEIRO E O SEGUNDO NOME, como sai em tudo que e publico (busca do "E
+// voce?", "Com quem falar?"). As ligacoes de/da/do/das/dos nao contam como
+// nome: elas entram junto com o nome que vem depois.
+//   "Maria Eduarda Nogueira" -> "Maria Eduarda"
+//   "Joao da Silva Santos"   -> "Joao da Silva"
+//   "Ana dos Anjos"          -> "Ana dos Anjos"
+// (A mesma regra existe no front: frontend/src/utils/names.js.)
+export function shortName(fullName) {
+  const words = cleanPersonName(fullName).split(" ").filter(Boolean);
+  if (words.length <= 1) return words[0] || "";
+  const out = [words[0]];
+  for (let i = 1; i < words.length; i += 1) {
+    out.push(words[i]);
+    if (!NAME_PARTICLES.has(words[i].toLocaleLowerCase("pt-BR"))) break;
+  }
+  // Terminou numa ligacao ("Maria de"): ela sai.
+  while (
+    out.length > 1 &&
+    NAME_PARTICLES.has(out[out.length - 1].toLocaleLowerCase("pt-BR"))
+  ) {
+    out.pop();
+  }
+  return out.join(" ");
+}
+
 export function isFullName(name) {
   return cleanPersonName(name).split(" ").filter(Boolean).length >= 2;
 }

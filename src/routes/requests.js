@@ -10,8 +10,10 @@ import {
   cleanPersonName,
   isFullName,
   NAME_ERROR,
+  shortName,
   withAdminFlag,
 } from "../services/people.js";
+import { maskPhone } from "../services/phone.js";
 import {
   availableOf,
   noFreeCopyMessage,
@@ -60,7 +62,9 @@ const LINK_GONE =
 
 // O "hoje" e o de Brasilia (o dia que a pessoa ve no calendario).
 function todayInBrazil() {
-  return new Date().toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" });
+  return new Date().toLocaleDateString("en-CA", {
+    timeZone: "America/Sao_Paulo",
+  });
 }
 
 function addDays(day, days) {
@@ -80,7 +84,10 @@ function readDay(value) {
   const text = typeof value === "string" ? value.trim().slice(0, 10) : "";
   if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
   const date = new Date(text + "T00:00:00Z");
-  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== text) {
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.toISOString().slice(0, 10) !== text
+  ) {
     return null;
   }
   return { text, date };
@@ -92,9 +99,7 @@ function readDay(value) {
 // branco" ou embaralhado nao passa pela conferencia de tamanho.
 function cleanText(value) {
   return typeof value === "string"
-    ? value
-        .replace(/\p{Cf}/gu, "")
-        .replace(/[\u0000-\u001f\u007f]/g, " ")
+    ? value.replace(/\p{Cf}/gu, "").replace(/[\u0000-\u001f\u007f]/g, " ")
     : "";
 }
 
@@ -118,7 +123,8 @@ function bookCopy(book) {
 
 // O livro como o painel o ve (mesmo formato de GET /api/books/:id).
 async function withSituation(book) {
-  const out = (await occupancyByBook([book._id])).get(String(book._id)) || NOTHING_OUT;
+  const out =
+    (await occupancyByBook([book._id])).get(String(book._id)) || NOTHING_OUT;
   return {
     ...book,
     copies: book.copies || 1,
@@ -173,7 +179,8 @@ const burstLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: {
-    error: "Muitas solicitações desta rede em pouco tempo. Aguarde alguns minutos e tente de novo.",
+    error:
+      "Muitas solicitações desta rede em pouco tempo. Aguarde alguns minutos e tente de novo.",
   },
 });
 // Por passe do reCAPTCHA (cada aparelho que marcou a caixa): 6 em 10 minutos.
@@ -185,7 +192,8 @@ const passLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: {
-    error: "Você já fez várias solicitações agora. Aguarde alguns minutos e tente de novo.",
+    error:
+      "Você já fez várias solicitações agora. Aguarde alguns minutos e tente de novo.",
   },
 });
 
@@ -229,7 +237,9 @@ function personRefKey() {
 function personRef(personId) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", personRefKey(), iv);
-  const plain = Buffer.from(String(personId) + "." + (Date.now() + PERSON_REF_MS));
+  const plain = Buffer.from(
+    String(personId) + "." + (Date.now() + PERSON_REF_MS),
+  );
   const sealed = Buffer.concat([cipher.update(plain), cipher.final()]);
   return Buffer.concat([iv, cipher.getAuthTag(), sealed]).toString("base64url");
 }
@@ -240,9 +250,16 @@ function readPersonRef(ref) {
   try {
     const raw = Buffer.from(ref, "base64url");
     if (raw.length < 29) return null;
-    const decipher = crypto.createDecipheriv("aes-256-gcm", personRefKey(), raw.subarray(0, 12));
+    const decipher = crypto.createDecipheriv(
+      "aes-256-gcm",
+      personRefKey(),
+      raw.subarray(0, 12),
+    );
     decipher.setAuthTag(raw.subarray(12, 28));
-    const plain = Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString();
+    const plain = Buffer.concat([
+      decipher.update(raw.subarray(28)),
+      decipher.final(),
+    ]).toString();
     const [id, until] = plain.split(".");
     if (!(Number(until) > Date.now())) return null;
     return readId(id);
@@ -263,8 +280,8 @@ function nameWords(value) {
 }
 
 /**
- * GET /api/public/requests/people?name=Maria Nog -> { people: [{ id, name,
- * hint }] }
+ * GET /api/public/requests/people?name=Maria Nog -> { people: [{ ref, name,
+ * phone, hint, photo, admin }] }
  *
  * "E voce?": quem esta pedindo um livro toca no proprio nome. O cadastro e de
  * gente da igreja, entao a busca e apertada de proposito:
@@ -274,67 +291,92 @@ function nameWords(value) {
  * - o primeiro nome tem de bater com o COMECO do nome cadastrado, e cada
  *   outra palavra com o comeco de alguma palavra do nome;
  * - no maximo 5 resultados;
- * - sai so o nome e, para separar dois nomes iguais, os 2 ultimos digitos do
- *   WhatsApp. Nada de foto, numero (#), telefone inteiro, livros nem o id do
- *   banco (vai uma "ref" cifrada, que vale 2 horas - ver personRef).
+ * - sai so o PRIMEIRO E O SEGUNDO NOME (ver shortName: "de/da/do/das/dos"
+ *   entram com o nome seguinte), a foto e, para separar dois nomes iguais, o
+ *   telefone mascarado ("+55 *******51": codigo do pais e 2 ultimos
+ *   digitos). Nada de nome completo, numero (#), telefone inteiro, livros nem
+ *   o id do banco (vai uma "ref" cifrada, que vale 2 horas - ver personRef);
+ * - admin: true quando a pessoa e da equipe (tem login no painel). O acervo
+ *   pede o login dela e leva direto ao "Registrar solicitação", sem
+ *   WhatsApp. (Quem e da equipe ja e publico: o "Com quem falar?" mostra os
+ *   dois primeiros nomes e a foto de cada um.) O login em si nunca sai.
+ * - hint: o mesmo telefone em texto antigo ("WhatsApp terminado em 51"),
+ *   para o app que ainda nao foi atualizado.
  */
-publicRequests.get("/people", searchLimiter, searchPassLimiter, async (req, res, next) => {
-  try {
-    res.set("Cache-Control", "no-store");
-    const words = nameWords(typeof req.query.name === "string" ? req.query.name : "");
-    if (
-      words.length < 2 ||
-      words[0].length < 3 ||
-      !words.slice(1).some((word) => word.length >= 2)
-    ) {
-      return res.json({ people: [] });
+publicRequests.get(
+  "/people",
+  searchLimiter,
+  searchPassLimiter,
+  async (req, res, next) => {
+    try {
+      res.set("Cache-Control", "no-store");
+      const words = nameWords(
+        typeof req.query.name === "string" ? req.query.name : "",
+      );
+      if (
+        words.length < 2 ||
+        words[0].length < 3 ||
+        !words.slice(1).some((word) => word.length >= 2)
+      ) {
+        return res.json({ people: [] });
+      }
+
+      const escape = (word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      // Comeco de palavra: inicio, espaco, hifen, apostrofo ou ponto.
+      const clauses = [
+        { nameSort: new RegExp("^" + escape(words[0])) },
+        ...words.slice(1).map((word) => ({
+          nameSort: new RegExp("(^|[\\s'\u2019.-])" + escape(word)),
+        })),
+      ];
+      const people = await Person.find({ $and: clauses })
+        .select("fullName phone photo username")
+        .sort({ nameSort: 1, _id: 1 })
+        .limit(MAX_NAME_RESULTS)
+        .lean();
+
+      return res.json({
+        people: people.map((person) => ({
+          ref: personRef(person._id),
+          name: shortName(person.fullName),
+          phone: maskPhone(person.phone),
+          photo: person.photo || "",
+          admin: typeof person.username === "string" && person.username !== "",
+          hint:
+            person.phone && person.phone.length >= 4
+              ? "WhatsApp terminado em " + person.phone.slice(-2)
+              : "",
+        })),
+      });
+    } catch (error) {
+      return next(error);
     }
-
-    const escape = (word) => word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    // Comeco de palavra: inicio, espaco, hifen, apostrofo ou ponto.
-    const clauses = [
-      { nameSort: new RegExp("^" + escape(words[0])) },
-      ...words.slice(1).map((word) => ({
-        nameSort: new RegExp("(^|[\\s'\u2019.-])" + escape(word)),
-      })),
-    ];
-    const people = await Person.find({ $and: clauses })
-      .select("fullName phone")
-      .sort({ nameSort: 1, _id: 1 })
-      .limit(MAX_NAME_RESULTS)
-      .lean();
-
-    return res.json({
-      people: people.map((person) => ({
-        ref: personRef(person._id),
-        name: person.fullName,
-        hint:
-          person.phone && person.phone.length >= 4
-            ? "WhatsApp terminado em " + person.phone.slice(-2)
-            : "",
-      })),
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
+  },
+);
 
 // POST /api/public/requests  { bookId, name, pickupDate, website, personRef?,
 // newPerson? } -> 201 { token, pickupDate, name } (200 quando o mesmo pedido
 // e repetido). personRef: a pessoa tocou no proprio nome na busca (o nome que
-// vale e o do cadastro); newPerson: tocou em "Nao sou nenhuma dessas pessoas".
+// vale e o do cadastro, e o "name" que volta e so o primeiro e o segundo
+// nome); newPerson: tocou em "Nao sou nenhuma dessas pessoas".
 publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
   try {
     const body = req.body || {};
     // Campo-isca escondido: so robo preenche.
-    if (body.website) return res.status(400).json({ error: "Pedido inválido." });
+    if (body.website)
+      return res.status(400).json({ error: "Pedido inválido." });
 
     const bookId = readId(body.bookId);
-    if (!bookId) return res.status(400).json({ error: "Esse livro não existe." });
+    if (!bookId)
+      return res.status(400).json({ error: "Esse livro não existe." });
 
     // Escolheu o proprio nome na busca: vale o nome do cadastro.
     let chosen = null;
-    if (body.personRef !== undefined && body.personRef !== null && body.personRef !== "") {
+    if (
+      body.personRef !== undefined &&
+      body.personRef !== null &&
+      body.personRef !== ""
+    ) {
       const personId = readPersonRef(body.personRef);
       chosen = personId
         ? await Person.findById(personId).select("fullName").lean()
@@ -342,24 +384,31 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
       if (!chosen) {
         return res.status(409).json({
           code: "PERSON_GONE",
-          error: "Não conseguimos confirmar o seu nome no cadastro. Toque nele de novo na lista.",
+          error:
+            "Não conseguimos confirmar o seu nome no cadastro. Toque nele de novo na lista.",
         });
       }
     }
     const requesterIsNew = !chosen && body.newPerson === true;
 
-    const name = chosen ? chosen.fullName : cleanPersonName(cleanText(body.name));
-    if (!name) return res.status(400).json({ error: "Digite o seu nome completo." });
+    const name = chosen
+      ? chosen.fullName
+      : cleanPersonName(cleanText(body.name));
+    if (!name)
+      return res.status(400).json({ error: "Digite o seu nome completo." });
     if (!chosen && (LINK.test(name) || !/\p{L}/u.test(name))) {
       return res.status(400).json({ error: "Digite só o seu nome completo." });
     }
-    if (!chosen && !isFullName(name)) return res.status(400).json({ error: NAME_ERROR });
+    if (!chosen && !isFullName(name))
+      return res.status(400).json({ error: NAME_ERROR });
 
     const today = todayInBrazil();
     const last = addDays(today, MAX_PICKUP_DAYS_AHEAD);
     const day = readDay(body.pickupDate);
     if (!day) {
-      return res.status(400).json({ error: "Escolha o dia em que quer pegar o livro." });
+      return res
+        .status(400)
+        .json({ error: "Escolha o dia em que quer pegar o livro." });
     }
     // Um dia de folga para tras: o relogio do celular pode estar atrasado.
     if (day.text < addDays(today, -1) || day.text > last) {
@@ -372,9 +421,12 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
       .select("title cover isbn copies")
       .lean();
     if (!book) {
-      return res.status(404).json({ error: "Esse livro não está mais no acervo." });
+      return res
+        .status(404)
+        .json({ error: "Esse livro não está mais no acervo." });
     }
-    const out = (await occupancyByBook([book._id])).get(String(book._id)) || NOTHING_OUT;
+    const out =
+      (await occupancyByBook([book._id])).get(String(book._id)) || NOTHING_OUT;
     if (availableOf(book, out) === 0) {
       return res.status(409).json({
         code: "BOOK_UNAVAILABLE",
@@ -384,6 +436,10 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
     }
 
     const nameKey = normalizeText(name);
+    // O que volta para a tela (e vai na mensagem do WhatsApp): de quem tocou
+    // num nome do cadastro, so o primeiro e o segundo nome - o nome completo
+    // fica gravado na solicitacao, para o painel.
+    const shownName = chosen ? shortName(name) : name;
     const linkExpiresAt = new Date(Date.now() + LINK_DAYS * DAY_MS);
 
     // A mesma pessoa pedindo o mesmo livro de novo (voltou e confirmou outra
@@ -408,7 +464,11 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
     );
     if (again) {
       preparePreview(book._id);
-      return res.json({ token: again.token, pickupDate: day.text, name });
+      return res.json({
+        token: again.token,
+        pickupDate: day.text,
+        name: shownName,
+      });
     }
 
     const createdToday = await LoanRequest.countDocuments({
@@ -439,7 +499,9 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
     // services/requestPreview.js): a resposta nao espera por ela.
     preparePreview(book._id);
 
-    return res.status(201).json({ token: request.token, pickupDate: day.text, name });
+    return res
+      .status(201)
+      .json({ token: request.token, pickupDate: day.text, name: shownName });
   } catch (error) {
     return next(error);
   }
@@ -453,7 +515,8 @@ publicRequests.use((err, req, res, next) => {
   }
   console.error("[solicitacoes]", err);
   return res.status(500).json({
-    error: "Não foi possível registrar a solicitação agora. Tente de novo em instantes.",
+    error:
+      "Não foi possível registrar a solicitação agora. Tente de novo em instantes.",
   });
 });
 
@@ -467,7 +530,8 @@ export async function ogPreviewHandler(req, res) {
   try {
     const token = String(req.params.token || "");
     const preview = TOKEN_PATTERN.test(token) ? await previewFor(token) : null;
-    if (!preview) return res.status(404).json({ error: "Link não encontrado." });
+    if (!preview)
+      return res.status(404).json({ error: "Link não encontrado." });
     return res.json(preview);
   } catch (error) {
     console.error("[previa]", error);
@@ -489,7 +553,9 @@ router.get("/", async (req, res, next) => {
     // Solicitacao que ficou no meio do "Realizar emprestimo" (servidor
     // reiniciou) e acertada aqui tambem, nao so ao iniciar o servidor.
     await recoverStuckConversions();
-    const requests = await LoanRequest.find({ status: { $in: OCCUPYING_REQUEST } })
+    const requests = await LoanRequest.find({
+      status: { $in: OCCUPYING_REQUEST },
+    })
       .sort({ pickupDate: 1, createdAt: 1, _id: 1 })
       .lean();
     // A foto de quem vai levar (o painel mostra o rosto para conferir).
@@ -498,7 +564,9 @@ router.get("/", async (req, res, next) => {
     })
       .select("photo")
       .lean();
-    const photoById = new Map(people.map((person) => [String(person._id), person.photo || ""]));
+    const photoById = new Map(
+      people.map((person) => [String(person._id), person.photo || ""]),
+    );
     return res.json(
       await withAdminFlag(
         requests.map((item) => ({
@@ -522,7 +590,8 @@ router.get("/link/:token", async (req, res, next) => {
     const request = TOKEN_PATTERN.test(token)
       ? await LoanRequest.findOne({ token }).lean()
       : null;
-    if (!request) return res.status(404).json({ code: "LINK_GONE", error: LINK_GONE });
+    if (!request)
+      return res.status(404).json({ code: "LINK_GONE", error: LINK_GONE });
     if (request.status !== "pendente") {
       return res.status(409).json({
         code: "LINK_USED",
@@ -567,14 +636,18 @@ router.post("/", async (req, res, next) => {
     const personId = readId(body.personId);
     if (!personId) {
       return res.status(400).json({
-        error: "Selecione a pessoa cadastrada (ou cadastre uma nova) antes de registrar.",
+        error:
+          "Selecione a pessoa cadastrada (ou cadastre uma nova) antes de registrar.",
       });
     }
     const day = readDay(body.pickupDate);
-    if (!day) return res.status(400).json({ error: "Informe a retirada prevista." });
+    if (!day)
+      return res.status(400).json({ error: "Informe a retirada prevista." });
     const today = todayInBrazil();
     if (day.text < addDays(today, -365) || day.text > addDays(today, 365)) {
-      return res.status(400).json({ error: "A retirada prevista não é válida." });
+      return res
+        .status(400)
+        .json({ error: "A retirada prevista não é válida." });
     }
 
     const token = typeof body.token === "string" ? body.token : "";
@@ -584,7 +657,8 @@ router.post("/", async (req, res, next) => {
       pending = TOKEN_PATTERN.test(token)
         ? await LoanRequest.findOne({ token }).lean()
         : null;
-      if (!pending) return res.status(404).json({ code: "LINK_GONE", error: LINK_GONE });
+      if (!pending)
+        return res.status(404).json({ code: "LINK_GONE", error: LINK_GONE });
       if (pending.status !== "pendente") {
         return res.status(409).json({
           code: "LINK_USED",
@@ -603,7 +677,8 @@ router.post("/", async (req, res, next) => {
     if (!book) return res.status(404).json({ error: "Livro não encontrado." });
 
     const person = await Person.findById(personId);
-    if (!person) return res.status(404).json({ error: "Pessoa não encontrada." });
+    if (!person)
+      return res.status(404).json({ error: "Pessoa não encontrada." });
 
     if (
       await LoanRequest.exists({
@@ -651,7 +726,11 @@ router.post("/", async (req, res, next) => {
         });
       }
     } else {
-      request = await LoanRequest.create({ book: book._id, token: null, ...fields });
+      request = await LoanRequest.create({
+        book: book._id,
+        token: null,
+        ...fields,
+      });
     }
 
     // Conferencia de depois de gravar (ver services/occupancy.js).
@@ -664,14 +743,16 @@ router.post("/", async (req, res, next) => {
       });
     }
 
-    return res.status(201).json(await withAdminFlag(toRequest(request.toObject())));
+    return res
+      .status(201)
+      .json(await withAdminFlag(toRequest(request.toObject())));
   } catch (error) {
     return next(error);
   }
 });
 
 // POST /api/requests/:id/loan  { startDate, dueDate, notes, force }
-// "Realizar empréstimo": a solicitacao vira emprestimo da MESMA pessoa e do
+// "Emprestar": a solicitacao vira emprestimo da MESMA pessoa e do
 // MESMO livro (nenhum dos dois muda aqui); so as datas e a observacao vem da
 // tela. Responde 201 com o emprestimo, e a solicitacao sai do banco.
 router.post("/:id/loan", async (req, res, next) => {
@@ -680,7 +761,8 @@ router.post("/:id/loan", async (req, res, next) => {
     const request = await LoanRequest.findById(req.params.id);
     if (!request || request.status === "pendente") {
       return res.status(404).json({
-        error: "Essa solicitação não existe mais (já virou empréstimo ou foi excluída).",
+        error:
+          "Essa solicitação não existe mais (já virou empréstimo ou foi excluída).",
       });
     }
     if (request.status === "convertendo") {
@@ -697,7 +779,8 @@ router.post("/:id/loan", async (req, res, next) => {
       Person.findById(request.person),
     ]);
     if (!book) return res.status(404).json({ error: "Livro não encontrado." });
-    if (!person) return res.status(404).json({ error: "Pessoa não encontrada." });
+    if (!person)
+      return res.status(404).json({ error: "Pessoa não encontrada." });
 
     // A mesma pergunta do Novo emprestimo: "ja esta com outro livro".
     const warning = body.force ? null : await activeLoanWarning(person);
@@ -712,7 +795,8 @@ router.post("/:id/loan", async (req, res, next) => {
     );
     if (!claimed) {
       return res.status(409).json({
-        error: "Essa solicitação acabou de virar empréstimo ou foi excluída. Atualize a tela.",
+        error:
+          "Essa solicitação acabou de virar empréstimo ou foi excluída. Atualize a tela.",
       });
     }
 
@@ -752,13 +836,18 @@ router.delete("/:id", async (req, res, next) => {
       status: "solicitado",
     });
     if (!removed) {
-      const still = await LoanRequest.findById(req.params.id).select("status").lean();
+      const still = await LoanRequest.findById(req.params.id)
+        .select("status")
+        .lean();
       if (still?.status === "convertendo") {
         return res.status(409).json({
-          error: "Essa solicitação está virando empréstimo agora. Atualize a tela.",
+          error:
+            "Essa solicitação está virando empréstimo agora. Atualize a tela.",
         });
       }
-      return res.status(404).json({ error: "Essa solicitação não existe mais." });
+      return res
+        .status(404)
+        .json({ error: "Essa solicitação não existe mais." });
     }
     announceAvailability(removed.book);
     return res.json({ ok: true });
@@ -779,7 +868,9 @@ router.delete("/:id", async (req, res, next) => {
  * (a folga cobre o servidor antigo ainda terminando um pedido durante a
  * troca de versao no Render).
  */
-export async function recoverStuckConversions({ olderThanMs = 30 * 1000 } = {}) {
+export async function recoverStuckConversions({
+  olderThanMs = 30 * 1000,
+} = {}) {
   const stuck = await LoanRequest.find({
     status: "convertendo",
     convertingAt: { $lt: new Date(Date.now() - olderThanMs) },

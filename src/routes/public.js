@@ -5,7 +5,7 @@ import Book, {
 } from "../models/Book.js";
 import Person from "../models/Person.js";
 import { MAX_CATEGORY_LENGTH } from "../services/categories.js";
-import { IS_ADMIN_FILTER } from "../services/people.js";
+import { IS_ADMIN_FILTER, shortName } from "../services/people.js";
 import { availableOf, occupancyByBook } from "../services/occupancy.js";
 
 /**
@@ -179,7 +179,7 @@ async function libraryStaff() {
     .filter((person) => person.fullName)
     .map((person) => ({
       id: String(person._id),
-      name: person.fullName.split(/\s+/).slice(0, 2).join(" "),
+      name: shortName(person.fullName),
       photo: person.photo || "",
     }))
     .sort((a, b) => a.name.localeCompare(b.name, "pt-BR"));
