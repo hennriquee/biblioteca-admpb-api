@@ -12,13 +12,10 @@ import {
   recordLoan,
 } from "../services/loans.js";
 import { announceAvailability } from "../services/returnAlerts.js";
+import { allWordsRegex, escapeRegex } from "../services/search.js";
 
 const router = Router();
 router.use(requireAdmin);
-
-function escapeRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 // GET /api/loans?status=ativo&book=texto&person=texto
 router.get("/", async (req, res, next) => {
@@ -29,13 +26,15 @@ router.get("/", async (req, res, next) => {
 
     const bookQuery = normalizeText(req.query.book || "");
     if (bookQuery) {
-      const regex = new RegExp(escapeRegex(bookQuery), "i");
-      filter.$or = [{ bookTitleSort: regex }, { bookIsbn: regex }];
+      filter.$or = [
+        { bookTitleSort: allWordsRegex(bookQuery) },
+        { bookIsbn: new RegExp(escapeRegex(bookQuery), "i") },
+      ];
     }
 
     const personQuery = normalizeText(req.query.person || "");
     if (personQuery) {
-      filter.personNameSort = new RegExp(escapeRegex(personQuery), "i");
+      filter.personNameSort = allWordsRegex(personQuery);
     }
 
     const loans = await Loan.find(filter).sort({ startDate: -1 }).lean();

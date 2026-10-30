@@ -7,6 +7,7 @@ import Person from "../models/Person.js";
 import { MAX_CATEGORY_LENGTH } from "../services/categories.js";
 import { IS_ADMIN_FILTER, shortName } from "../services/people.js";
 import { availableOf, occupancyByBook } from "../services/occupancy.js";
+import { allWordsRegex, escapeRegex } from "../services/search.js";
 
 /**
  * Rotas PUBLICAS (sem login) do acervo. Alimentam a pagina /catalogo, que e
@@ -55,42 +56,15 @@ function intParam(value, fallback, min, max) {
   return Math.min(max, Math.max(min, number));
 }
 
-function escapeRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-// Os autores sao guardados com acento ("João"), mas a busca chega sem
-// ("joao"). Cada letra com variantes vira uma classe: "j[oòóôõö]..." .
-const ACCENT_VARIANTS = {
-  a: "aàáâãäå",
-  c: "cç",
-  e: "eèéêë",
-  i: "iìíîï",
-  n: "nñ",
-  o: "oòóôõö",
-  u: "uùúûü",
-  y: "yýÿ",
-};
-
-function accentInsensitive(term) {
-  return [...term]
-    .map((char) =>
-      ACCENT_VARIANTS[char]
-        ? "[" + ACCENT_VARIANTS[char] + "]"
-        : escapeRegex(char),
-    )
-    .join("");
-}
-
 // Busca por titulo, ISBN e autor. "term" ja vem normalizado (minusculo, sem
-// acento) e com tamanho limitado.
+// acento) e com tamanho limitado. Titulo e autor valem por palavras (ver
+// services/search.js): "Maria Dias" acha a autora "Maria Arantes Dias".
 function searchClause(term) {
   if (!term) return null;
-  const plain = new RegExp(escapeRegex(term), "i");
   const clauses = [
-    { titleSort: plain },
-    { isbn: plain },
-    { authors: new RegExp(accentInsensitive(term), "i") },
+    { titleSort: allWordsRegex(term) },
+    { isbn: new RegExp(escapeRegex(term), "i") },
+    { authors: allWordsRegex(term, { accents: true }) },
   ];
   // ISBN digitado com hifens ("978-85-...") tambem acha o cadastro sem hifens.
   const digits = term.replace(/[\s-]/g, "");

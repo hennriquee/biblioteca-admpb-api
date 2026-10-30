@@ -16,6 +16,7 @@ import {
 } from "../services/images.js";
 import { fetchRemoteImage } from "../services/remoteImage.js";
 import { announceAvailability } from "../services/returnAlerts.js";
+import { allWordsRegex, escapeRegex } from "../services/search.js";
 import {
   availableOf,
   NOTHING_OUT,
@@ -143,12 +144,20 @@ router.get("/", async (req, res, next) => {
     const byStatus = await statusClause(String(req.query.status || ""));
     if (byStatus) filter._id = byStatus;
 
+    // Titulo e autor por palavras (ver services/search.js); o autor e
+    // guardado com acento, a busca chega sem.
     if (search) {
-      const regex = new RegExp(
-        search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-        "i",
-      );
-      filter.$or = [{ titleSort: regex }, { isbn: regex }, { authors: regex }];
+      filter.$or = [
+        { titleSort: allWordsRegex(search) },
+        { isbn: new RegExp(escapeRegex(search), "i") },
+        { authors: allWordsRegex(search, { accents: true }) },
+      ];
+      // ISBN digitado com hifens tambem acha o cadastro sem hifens (como no
+      // acervo publico, routes/public.js).
+      const digits = search.replace(/[\s-]/g, "");
+      if (digits !== search && /^[0-9x]+$/.test(digits)) {
+        filter.$or.push({ isbn: new RegExp(escapeRegex(digits), "i") });
+      }
     }
 
     const paginate =

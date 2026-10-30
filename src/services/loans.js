@@ -19,6 +19,9 @@ function badRequest(message) {
  * Le e confere as datas do emprestimo. Devolve { start, due } ou lanca 400.
  * As datas sao conferidas no SERVIDOR, nao so na tela: um prazo antes da
  * retirada faria a barra de progresso contar um tempo negativo.
+ * A devolucao combinada e obrigatoria: a tela comeca com ela vazia para o
+ * administrador combinar a data com a pessoa (emprestimos antigos sem data
+ * continuam valendo; isto so vale para os novos).
  */
 export function readLoanDates(startDate, dueDate) {
   if (!startDate) throw badRequest("Informe a data de retirada.");
@@ -26,15 +29,15 @@ export function readLoanDates(startDate, dueDate) {
   if (Number.isNaN(start.getTime())) {
     throw badRequest("A data de retirada não é válida.");
   }
-  let due = null;
-  if (dueDate) {
-    due = new Date(dueDate);
-    if (Number.isNaN(due.getTime())) {
-      throw badRequest("A data de devolução não é válida.");
-    }
-    if (due < start) {
-      throw badRequest("A data de devolução não pode ser anterior à da retirada.");
-    }
+  if (!dueDate) {
+    throw badRequest("Preencha a data de devolução combinada com a pessoa.");
+  }
+  const due = new Date(dueDate);
+  if (Number.isNaN(due.getTime())) {
+    throw badRequest("A data de devolução não é válida.");
+  }
+  if (due < start) {
+    throw badRequest("A data de devolução não pode ser anterior à da retirada.");
   }
   return { start, due };
 }

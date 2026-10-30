@@ -1,10 +1,12 @@
 import { Router } from "express";
+import mongoose from "mongoose";
 import Person from "../models/Person.js";
 import Loan from "../models/Loan.js";
 import LoanRequest from "../models/LoanRequest.js";
 import { OCCUPYING_REQUEST } from "../services/occupancy.js";
 import { normalizeText } from "../models/Book.js";
 import { requireAdmin } from "../middleware/auth.js";
+import { allWordsRegex, matchRank } from "../services/search.js";
 import {
   assertValidImage,
   deleteImage,
@@ -48,10 +50,8 @@ router.use(requireAdmin);
 // filtra no proprio navegador, como o acervo).
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 1000;
-
-function escapeRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+// Quantas fichas a busca le para escolher as que batem melhor.
+const MAX_RANKED = 2000;
 
 // O que sai daqui sobre uma pessoa. A senha (nem o hash dela) nunca entra.
 function toPerson(person, extra = {}) {
@@ -98,7 +98,9 @@ router.get("/", async (req, res, next) => {
     );
 
     const filter = {};
-    if (search) filter.nameSort = new RegExp(escapeRegex(search), "i");
+    // Por palavras (ver services/search.js): "Maria Dias" acha
+    // "Maria Alessandra Arantes Dias".
+    if (search) filter.nameSort = allWordsRegex(search);
 
     // O createdAt desempata as fichas que (por algum motivo) ficaram sem
     // numero - elas aparecem no INICIO da lista, na ordem de cadastro, porque
@@ -107,7 +109,36 @@ router.get("/", async (req, res, next) => {
     const order =
       req.query.sort === "code" ? { code: 1, createdAt: 1 } : { nameSort: 1 };
 
-    const people = await Person.find(filter).sort(order).limit(limit).lean();
+    let people;
+    if (search && req.query.sort !== "code") {
+      // Sugestoes: as que batem MELHOR primeiro (ver matchRank), e so entao
+      // a ordem alfabetica. Por isso todas as que batem sao lidas e
+      // ordenadas aqui, antes do corte.
+      // Para dar a nota basta o nome; a ficha inteira so das escolhidas.
+      const found = await Person.find(filter)
+        .select("nameSort")
+        .sort(order)
+        .limit(MAX_RANKED)
+        .lean();
+      const chosen = found
+        .map((person, index) => ({
+          id: String(person._id),
+          index,
+          rank: matchRank(person.nameSort, search),
+        }))
+        .sort((a, b) => a.rank - b.rank || a.index - b.index)
+        .slice(0, limit)
+        .map((entry) => entry.id);
+      const byId = new Map(
+        (await Person.find({ _id: { $in: chosen } }).lean()).map((person) => [
+          String(person._id),
+          person,
+        ]),
+      );
+      people = chosen.map((id) => byId.get(id)).filter(Boolean);
+    } else {
+      people = await Person.find(filter).sort(order).limit(limit).lean();
+    }
     const loansByPerson = await activeLoansByPerson(people);
 
     return res.json(
@@ -142,6 +173,29 @@ router.get("/check", async (req, res, next) => {
       person: toPerson(person),
       activeLoans: loans,
     });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// GET /api/people/:id -> a ficha como esta AGORA no banco. O Novo emprestimo
+// rele antes de perguntar "Alterar o WhatsApp?": outro administrador pode ter
+// corrigido o numero depois que a pessoa foi escolhida na lista.
+router.get("/:id", async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ error: "Pessoa não encontrada." });
+    }
+    const person = await Person.findById(req.params.id).lean();
+    if (!person) {
+      return res.status(404).json({ error: "Pessoa não encontrada." });
+    }
+    const loansByPerson = await activeLoansByPerson([person]);
+    return res.json(
+      toPerson(person, {
+        activeLoans: loansByPerson.get(String(person._id)) || [],
+      }),
+    );
   } catch (error) {
     return next(error);
   }
