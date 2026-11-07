@@ -74,6 +74,13 @@ const loanRequestSchema = new mongoose.Schema(
     // Marca do "convertendo" (ver recoverStuckConversions em routes/requests.js).
     convertingAt: { type: Date, default: null },
 
+    // Lembrete ao entrar no painel (GET /api/requests/reminders): os
+    // administradores que ja fecharam o aviso "retirada e hoje" e o aviso
+    // "retirada em atraso" desta solicitacao. Cada um ve cada aviso uma vez
+    // so. (Registro de antes destes campos fica sem eles: ninguem viu ainda.)
+    todaySeenBy: { type: [mongoose.Schema.Types.ObjectId], default: undefined },
+    lateSeenBy: { type: [mongoose.Schema.Types.ObjectId], default: undefined },
+
     // TTL: so a pendente tem data aqui. null nao e data, entao o MongoDB
     // ignora a registrada e ela nunca expira sozinha.
     linkExpiresAt: { type: Date, default: null, index: { expireAfterSeconds: 0 } },

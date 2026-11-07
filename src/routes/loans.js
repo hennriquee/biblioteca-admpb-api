@@ -1,4 +1,5 @@
 import { Router } from "express";
+import mongoose from "mongoose";
 import Loan from "../models/Loan.js";
 import Book, { normalizeText } from "../models/Book.js";
 import Person from "../models/Person.js";
@@ -16,6 +17,15 @@ import { allWordsRegex, escapeRegex } from "../services/search.js";
 
 const router = Router();
 router.use(requireAdmin);
+
+// Endereco com id que nem e id do banco: "nao encontrado", em vez do erro
+// cru do Mongoose (500).
+router.param("id", (req, res, next, id) => {
+  if (!mongoose.isValidObjectId(id)) {
+    return res.status(404).json({ error: "Empréstimo não encontrado." });
+  }
+  return next();
+});
 
 // GET /api/loans?status=ativo&book=texto&person=texto
 router.get("/", async (req, res, next) => {
@@ -116,20 +126,234 @@ router.post("/", async (req, res, next) => {
   }
 });
 
-// PATCH /api/loans/:id/notified  { kind: "reminder" | "overdue" }
-// Registra que o administrador abriu o WhatsApp para avisar a pessoa.
+// ---------- Datas (dia de Brasilia) ----------
+
+// Cobranca de atraso pelo WhatsApp: no maximo uma a cada 30 dias por
+// emprestimo, seja qual for o administrador.
+const CHARGE_INTERVAL_DAYS = 30;
+// Prazo estendido: no maximo um ano a frente de hoje (barra data digitada
+// errada, como 2062 no lugar de 2026).
+const MAX_EXTENSION_DAYS = 365;
+
+function todayInBrazil() {
+  return new Date().toLocaleDateString("en-CA", {
+    timeZone: "America/Sao_Paulo",
+  });
+}
+
+// O dia ("AAAA-MM-DD") de uma data salva, do mesmo jeito que o app mostra
+// (utils/dates.js no front): meia-noite UTC e "so a data" (e assim que as
+// datas dos campos chegam aqui); o resto vale pelo dia de Brasilia.
+function dayOf(date) {
+  if (!date) return "";
+  const value = new Date(date);
+  if (
+    value.getUTCHours() === 0 &&
+    value.getUTCMinutes() === 0 &&
+    value.getUTCSeconds() === 0 &&
+    value.getUTCMilliseconds() === 0
+  ) {
+    return value.toISOString().slice(0, 10);
+  }
+  return value.toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" });
+}
+
+// O dia de Brasilia de um MOMENTO (ex.: quando cobrou).
+function brazilDay(date) {
+  return new Date(date).toLocaleDateString("en-CA", {
+    timeZone: "America/Sao_Paulo",
+  });
+}
+
+// O dia em que a proxima cobranca fica liberada.
+function nextChargeDay(sentAt) {
+  return addDays(brazilDay(sentAt), CHARGE_INTERVAL_DAYS);
+}
+
+function addDays(day, days) {
+  const date = new Date(day + "T00:00:00Z");
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function brDate(day) {
+  const [year, month, date] = day.split("-");
+  return date + "/" + month + "/" + year;
+}
+
+// Atrasado = em andamento e o dia combinado ja passou (o proprio dia ainda
+// esta no prazo), igual a barra dos cards.
+function isOverdue(loan) {
+  return (
+    loan.status === "ativo" &&
+    Boolean(loan.dueDate) &&
+    todayInBrazil() > dayOf(loan.dueDate)
+  );
+}
+
+// PATCH /api/loans/:id/notified
+// Registra a COBRANCA do atraso pelo WhatsApp, em nome do administrador da
+// sessao. O app registra ANTES de abrir o WhatsApp: com a regra de uma a cada
+// 30 dias, quem decide se a cobranca pode sair e o servidor (dois
+// administradores com a tela aberta nao cobram a mesma pessoa duas vezes).
 router.patch("/:id/notified", async (req, res, next) => {
   try {
-    const field =
-      req.body.kind === "overdue" ? "overdueSentAt" : "reminderSentAt";
-    const loan = await Loan.findByIdAndUpdate(
-      req.params.id,
-      { [field]: new Date() },
-      { new: true },
-    );
+    const loan = await Loan.findById(req.params.id);
     if (!loan)
       return res.status(404).json({ error: "Empréstimo não encontrado." });
-    return res.json(await withAdminFlag(loan.toObject()));
+    const current = async () => withAdminFlag(loan.toObject());
+    if (loan.status !== "ativo") {
+      return res.status(409).json({
+        error: "Esse empréstimo já foi devolvido.",
+        loan: await current(),
+      });
+    }
+    if (!loan.personPhone) {
+      return res.status(409).json({
+        error: "Esse empréstimo não tem WhatsApp cadastrado.",
+        loan: await current(),
+      });
+    }
+    if (!isOverdue(loan)) {
+      return res.status(409).json({
+        error: "O prazo desse empréstimo ainda não venceu: a cobrança só vale para livro atrasado.",
+        loan: await current(),
+      });
+    }
+
+    // A conta e por DIA de Brasilia: cobrado no dia 7, libera no dia 7 do mes
+    // seguinte (30 dias depois), a qualquer hora. Vale quem cobrou antes do
+    // inicio (03:00 UTC) do dia "hoje - 29".
+    const limit = new Date(
+      addDays(todayInBrazil(), -(CHARGE_INTERVAL_DAYS - 1)) + "T03:00:00Z",
+    );
+    // Confere e grava de uma vez so: entre ler e gravar, outro administrador
+    // pode ter cobrado, estendido o prazo ou confirmado a devolucao.
+    const updated = await Loan.findOneAndUpdate(
+      {
+        _id: loan._id,
+        status: "ativo",
+        dueDate: loan.dueDate,
+        $or: [{ overdueSentAt: null }, { overdueSentAt: { $lt: limit } }],
+      },
+      {
+        overdueSentAt: new Date(),
+        overdueSentBy: req.account._id,
+        overdueSentByName: req.account.fullName,
+      },
+      { new: true },
+    );
+    if (!updated) {
+      const fresh = await Loan.findById(loan._id);
+      if (!fresh) {
+        return res.status(404).json({ error: "Empréstimo não encontrado." });
+      }
+      const freshLoan = await withAdminFlag(fresh.toObject());
+      let error =
+        "Esse empréstimo acabou de mudar. Confira os detalhes e tente de novo.";
+      if (fresh.status !== "ativo") {
+        error = "Esse empréstimo acabou de ser devolvido.";
+      } else if (!isOverdue(fresh)) {
+        error =
+          "O prazo desse empréstimo acabou de ser estendido: ele não está mais atrasado.";
+      } else if (fresh.overdueSentAt && fresh.overdueSentAt >= limit) {
+        error =
+          (fresh.overdueSentByName || "Alguém") +
+          " já cobrou essa pessoa em " +
+          brDate(brazilDay(fresh.overdueSentAt)) +
+          ". A próxima cobrança fica liberada em " +
+          brDate(nextChargeDay(fresh.overdueSentAt)) +
+          ".";
+      }
+      return res.status(409).json({ error, loan: freshLoan });
+    }
+    return res.json(await withAdminFlag(updated.toObject()));
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// PATCH /api/loans/:id/due  { dueDate: "AAAA-MM-DD" }
+// Estende o prazo de um emprestimo em andamento (em dia ou atrasado). A data
+// nova vem depois da combinada e nao antes de hoje; o card passa a mostrar
+// que o prazo foi estendido, por quem e qual era o anterior.
+router.patch("/:id/due", async (req, res, next) => {
+  try {
+    const raw = String(req.body.dueDate || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+      return res.status(400).json({ error: "Escolha a nova data de devolução." });
+    }
+    const due = new Date(raw + "T00:00:00Z");
+    if (Number.isNaN(due.getTime()) || dayOf(due) !== raw) {
+      return res.status(400).json({ error: "A nova data de devolução não é válida." });
+    }
+
+    const loan = await Loan.findById(req.params.id);
+    if (!loan)
+      return res.status(404).json({ error: "Empréstimo não encontrado." });
+    if (loan.status !== "ativo") {
+      return res.status(409).json({
+        error: "Esse empréstimo já foi devolvido; o prazo não pode mais mudar.",
+        loan: await withAdminFlag(loan.toObject()),
+      });
+    }
+
+    const today = todayInBrazil();
+    const currentDay = dayOf(loan.dueDate);
+    if (currentDay && raw <= currentDay) {
+      return res.status(400).json({
+        error:
+          "Para estender, a nova data precisa ser depois de " +
+          brDate(currentDay) +
+          ", a devolução combinada agora.",
+      });
+    }
+    if (raw < today) {
+      return res.status(400).json({
+        error: "A nova data de devolução não pode ser antes de hoje.",
+      });
+    }
+    if (raw < dayOf(loan.startDate)) {
+      return res.status(400).json({
+        error: "A nova data de devolução não pode ser anterior à da retirada.",
+      });
+    }
+    if (raw > addDays(today, MAX_EXTENSION_DAYS)) {
+      return res.status(400).json({
+        error: "O prazo pode ser estendido por até um ano a partir de hoje.",
+      });
+    }
+
+    // So grava se o prazo ainda for o que foi conferido acima (outro
+    // administrador pode ter acabado de estender).
+    const updated = await Loan.findOneAndUpdate(
+      { _id: loan._id, status: "ativo", dueDate: loan.dueDate },
+      {
+        $set: { dueDate: due, reminderSentAt: null },
+        $push: {
+          dueExtensions: {
+            from: loan.dueDate,
+            to: due,
+            at: new Date(),
+            by: req.account._id,
+            byName: req.account.fullName,
+          },
+        },
+      },
+      { new: true },
+    );
+    if (!updated) {
+      // Manda o emprestimo de agora: a janela passa a mostrar o prazo novo.
+      const fresh = await Loan.findById(loan._id);
+      return res.status(409).json({
+        error:
+          fresh && fresh.status !== "ativo"
+            ? "Esse empréstimo acabou de ser devolvido; o prazo não pode mais mudar."
+            : "Outro administrador acabou de mudar o prazo desse empréstimo. Confira a data combinada agora e escolha de novo.",
+        loan: fresh ? await withAdminFlag(fresh.toObject()) : null,
+      });
+    }
+    return res.json(await withAdminFlag(updated.toObject()));
   } catch (error) {
     return next(error);
   }

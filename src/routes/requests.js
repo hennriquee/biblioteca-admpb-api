@@ -160,7 +160,8 @@ async function personCard(personId) {
 // O que sai sobre uma solicitacao: o token do link nunca sai do servidor
 // depois de criado (quem tem o link ja o conhece).
 function toRequest(request) {
-  const { token, ...rest } = request;
+  // Quem ja viu os lembretes e assunto so da rota deles (ver /reminders).
+  const { token, todaySeenBy, lateSeenBy, ...rest } = request;
   return { ...rest, fromLink: Boolean(token) };
 }
 
@@ -575,6 +576,98 @@ router.get("/", async (req, res, next) => {
         })),
       ),
     );
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// ---------- Lembretes ao entrar no painel ----------
+//
+// Solicitacao cuja retirada prevista e HOJE (dia de Brasilia) ou ja PASSOU e
+// que ainda nao virou emprestimo: o painel avisa cada administrador com uma
+// janela ao entrar ("tem solicitacoes para entregar hoje" / "ha solicitacoes
+// em atraso"). Fechando a janela, aquele administrador nao ve mais aquele
+// aviso daquela solicitacao (ver todaySeenBy/lateSeenBy em
+// models/LoanRequest.js). Sao dois avisos separados: quem viu o "hoje" ainda
+// ve o "em atraso" se a pessoa nao vier buscar.
+
+// Teto de ids num "visto" (a janela nunca mostra tantas; so barra lixo).
+const MAX_REMINDER_IDS = 500;
+
+function reminderItem(request, seenField, adminId) {
+  return {
+    _id: request._id,
+    bookTitle: request.bookTitle,
+    bookCover: request.bookCover || "",
+    personName: request.personName,
+    pickupDate: request.pickupDate,
+    seen: (request[seenField] || []).some((id) => String(id) === adminId),
+  };
+}
+
+// GET /api/requests/reminders
+// -> { today: "AAAA-MM-DD", dueToday: [item], late: [item] }, cada item com
+// seen: se ESTE administrador ja fechou o aviso dela. A janela abre quando ha
+// pelo menos um item com seen false, e mostra todos os do assunto.
+router.get("/reminders", async (req, res, next) => {
+  try {
+    const today = todayInBrazil();
+    const todayDate = readDay(today).date;
+    const adminId = String(req.account._id);
+    const requests = await LoanRequest.find({
+      status: { $in: OCCUPYING_REQUEST },
+      pickupDate: { $lte: todayDate },
+    })
+      .select("bookTitle bookCover personName pickupDate todaySeenBy lateSeenBy")
+      .sort({ pickupDate: 1, createdAt: 1, _id: 1 })
+      .lean();
+    const dueToday = [];
+    const late = [];
+    for (const request of requests) {
+      if (request.pickupDate.getTime() === todayDate.getTime()) {
+        dueToday.push(reminderItem(request, "todaySeenBy", adminId));
+      } else {
+        late.push(reminderItem(request, "lateSeenBy", adminId));
+      }
+    }
+    res.set("Cache-Control", "no-store");
+    return res.json({ today, dueToday, late });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// POST /api/requests/reminders/seen  { kind: "today" | "late", ids: [...] }
+// O administrador fechou a janela: marca como visto por ELE o aviso dessas
+// solicitacoes. So marca as que ainda estao naquele assunto agora (a janela
+// do "hoje" fechada depois da meia-noite nao marca nada: amanha a mesma
+// solicitacao aparece no "em atraso", que e o aviso certo para ela).
+router.post("/reminders/seen", async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const kind = body.kind === "today" || body.kind === "late" ? body.kind : null;
+    const ids = Array.isArray(body.ids)
+      ? [...new Set(body.ids.map(readId).filter(Boolean))]
+      : [];
+    if (
+      !kind ||
+      !ids.length ||
+      !Array.isArray(body.ids) ||
+      body.ids.length > MAX_REMINDER_IDS
+    ) {
+      return res.status(400).json({ error: "Lembrete inválido." });
+    }
+    const todayDate = readDay(todayInBrazil()).date;
+    const field = kind === "today" ? "todaySeenBy" : "lateSeenBy";
+    await LoanRequest.updateMany(
+      {
+        _id: { $in: ids },
+        status: { $in: OCCUPYING_REQUEST },
+        pickupDate: kind === "today" ? todayDate : { $lt: todayDate },
+      },
+      { $addToSet: { [field]: req.account._id } },
+    );
+    return res.json({ ok: true });
   } catch (error) {
     return next(error);
   }

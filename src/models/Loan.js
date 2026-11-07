@@ -20,8 +20,35 @@ const loanSchema = new mongoose.Schema(
     // Vazio = sem WhatsApp cadastrado, e o botao de aviso nao aparece.
     personPhone: { type: String, default: '' },
     // Marcam quando o administrador abriu o WhatsApp para avisar.
+    // reminderSentAt e do aviso "a vencer", que o painel nao oferece mais
+    // (fica para os registros antigos).
     reminderSentAt: { type: Date, default: null },
+    // COBRANCA de atraso: a ultima vez que alguem abriu o WhatsApp para
+    // cobrar, e quem foi. So pode haver uma a cada 30 dias (ver
+    // CHARGE_INTERVAL_DAYS em routes/loans.js).
     overdueSentAt: { type: Date, default: null },
+    overdueSentBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Person',
+      default: null,
+    },
+    overdueSentByName: { type: String, default: '' },
+
+    // Prazos estendidos, do mais antigo ao mais novo: de que data (from) para
+    // qual (to), quando e por quem. dueDate ja e sempre o prazo de agora.
+    dueExtensions: {
+      type: [
+        {
+          _id: false,
+          from: { type: Date, default: null },
+          to: { type: Date, required: true },
+          at: { type: Date, required: true },
+          by: { type: mongoose.Schema.Types.ObjectId, ref: 'Person', default: null },
+          byName: { type: String, default: '' },
+        },
+      ],
+      default: [],
+    },
 
     // QUEM APROVOU: o administrador que registrou o emprestimo. Guarda o
     // nome junto (como faz com o do livro e com o de quem pegou) para o
