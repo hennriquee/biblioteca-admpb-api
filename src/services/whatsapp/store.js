@@ -256,6 +256,54 @@ export async function markEdited(chatId, waId, text) {
   if (result) await refreshLastMessage(chatId);
 }
 
+/**
+ * Guarda o temporizador de mensagens temporarias da conversa (segundos; 0 =
+ * desligado), se a mensagem de onde ele veio e a mais nova ate agora (o
+ * historico chega fora de ordem).
+ */
+export async function noteEphemeral(chatId, value, at) {
+  if (!Number.isFinite(value) || value < 0) return;
+  const when = at instanceof Date ? at : new Date(at || Date.now());
+  await WaChat.updateOne(
+    { _id: chatId, $or: [{ ephemeralAt: null }, { ephemeralAt: { $lte: when } }] },
+    { $set: { ephemeral: Math.floor(value), ephemeralAt: when } }
+  );
+}
+
+/**
+ * Apaga a conversa que ficou vazia (as mensagens dela ja sumiram pelo tempo).
+ * Se uma mensagem chegou no mesmo instante, a conversa volta (com ela).
+ * @returns {Promise<boolean>} se apagou.
+ */
+export async function dropEmptyChat(chat) {
+  const removed = await WaChat.deleteOne({ _id: chat._id, lastMessageAt: chat.lastMessageAt ?? null });
+  if (!removed.deletedCount) return false;
+  if (!(await WaMessage.exists({ chat: chat._id }))) return true;
+  // Chegou mensagem entre a conferencia e o apagar: devolve a conversa.
+  try {
+    await WaChat.collection.insertOne(chat);
+    await refreshLastMessage(chat._id);
+  } catch (error) {
+    if (error.code !== 11000) throw error;
+    // A mensagem nova ja criou outra conversa com a mesma chave: as mensagens
+    // vao para ela.
+    const other = await WaChat.findOne({ key: chat.key }).select('_id').lean();
+    if (other) {
+      const cursor = WaMessage.find({ chat: chat._id }).cursor();
+      for await (const message of cursor) {
+        try {
+          await WaMessage.updateOne({ _id: message._id }, { $set: { chat: other._id } });
+        } catch (moveError) {
+          if (moveError.code !== 11000) throw moveError;
+          await WaMessage.deleteOne({ _id: message._id });
+        }
+      }
+      await refreshLastMessage(other._id);
+    }
+  }
+  return false;
+}
+
 /** Recalcula a "ultima mensagem" mostrada na lista. */
 export async function refreshLastMessage(chatId) {
   const last = await WaMessage.findOne({ chat: chatId }).sort({ at: -1 }).lean();

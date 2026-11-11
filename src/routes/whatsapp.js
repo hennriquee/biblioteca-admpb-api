@@ -187,9 +187,26 @@ async function peopleByChat(chats) {
   return byKey;
 }
 
+// MENSAGENS TEMPORARIAS (services/whatsapp/retention.js): cada mensagem some
+// do painel disappearDays dias depois de enviada. A limpeza roda de meia em
+// meia hora; ate la, o que ja venceu nao aparece.
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function disappearMs() {
+  const days = Number(whatsapp.config.disappearDays) || 0;
+  return days > 0 ? days * DAY_MS : 0;
+}
+
+// Mensagem enviada antes disto ja sumiu (null = nada some).
+function visibleFrom() {
+  const ms = disappearMs();
+  return ms ? new Date(Date.now() - ms) : null;
+}
+
 function chatDto(chat, people) {
   const list = (chat.phone && people.get(canonicalPhone(chat.phone))) || [];
   const person = list[0] || null;
+  const ms = disappearMs();
   return {
     _id: chat._id,
     phone: chat.phone || '',
@@ -209,6 +226,11 @@ function chatDto(chat, people) {
     lastMessageFromMe: Boolean(chat.lastMessageFromMe),
     unread: chat.unread || 0,
     attendance: attendanceOf(chat),
+    // Dias ate cada mensagem sumir (0 = nunca) e quando a conversa inteira
+    // some, se ninguem mais escrever (null = sem mensagens ou nunca).
+    disappearDays: ms ? whatsapp.config.disappearDays : 0,
+    expiresAt:
+      ms && chat.lastMessageAt ? new Date(new Date(chat.lastMessageAt).getTime() + ms) : null,
   };
 }
 
@@ -230,7 +252,10 @@ function sendError(res, error) {
 }
 
 async function totalUnread() {
+  const from = visibleFrom();
   const [row] = await WaChat.aggregate([
+    // (a conversa que ja sumiu da lista nao conta)
+    ...(from ? [{ $match: { lastMessageAt: { $gte: from } } }] : []),
     { $group: { _id: null, total: { $sum: '$unread' } } },
   ]);
   return row?.total || 0;
@@ -285,10 +310,13 @@ router.get('/chats', readLimiter, async (req, res, next) => {
   try {
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 60));
     const filter = { lastMessageAt: { $ne: null } };
+    // A conversa cuja ultima mensagem ja venceu sumiu (mesmo antes da limpeza).
+    const from = visibleFrom();
+    if (from) filter.lastMessageAt.$gte = from;
 
     const before = req.query.before ? new Date(String(req.query.before)) : null;
     if (before && !Number.isNaN(before.getTime())) {
-      filter.lastMessageAt = { $ne: null, $lt: before };
+      filter.lastMessageAt.$lt = before;
     }
 
     // Sem caracteres de controle: um byte nulo faz o banco recusar a busca.
@@ -384,6 +412,8 @@ router.get('/chats/:id/messages', readLimiter, async (req, res, next) => {
     if (!chat) return res.status(404).json({ error: 'Conversa não encontrada.' });
 
     const now = new Date();
+    // Mensagens que ja venceram (mensagens temporarias) nao aparecem.
+    const from = visibleFrom();
     const since = req.query.since ? new Date(String(req.query.since)) : null;
     if (since && !Number.isNaN(since.getTime())) {
       // Em ordem de alteracao: se passar de 300, devolve as 300 primeiras e
@@ -391,7 +421,11 @@ router.get('/chats/:id/messages', readLimiter, async (req, res, next) => {
       // novo na hora). Antes, o excedente nunca chegava a uma conversa aberta.
       // ("$gte": mensagens alteradas no mesmo instante nao ficam de fora; as
       // repetidas a tela descarta pelo id.)
-      const changed = await WaMessage.find({ chat: chat._id, updatedAt: { $gte: since } })
+      const changed = await WaMessage.find({
+        chat: chat._id,
+        updatedAt: { $gte: since },
+        ...(from ? { at: { $gte: from } } : {}),
+      })
         .sort({ updatedAt: 1 })
         .limit(MAX_CHANGES + 1)
         .lean();
@@ -406,10 +440,11 @@ router.get('/chats/:id/messages', readLimiter, async (req, res, next) => {
 
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
     const filter = { chat: chat._id };
+    if (from) filter.at = { $gte: from };
     const before = req.query.before ? new Date(String(req.query.before)) : null;
     // "ate" e nao "antes de": varias mensagens podem ter o mesmo segundo, e
     // pular a do limite as esconderia. A tela descarta as repetidas pelo id.
-    if (before && !Number.isNaN(before.getTime())) filter.at = { $lte: before };
+    if (before && !Number.isNaN(before.getTime())) filter.at = { ...filter.at, $lte: before };
     const page = await WaMessage.find(filter)
       .sort({ at: -1 })
       .limit(limit + 1)
@@ -572,10 +607,13 @@ router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
       console.error('WhatsApp: não foi possível pausar o atendimento automático:', error.message);
     });
 
+    // (A conversa pode ter sido apagada do painel durante o envio: a mensagem
+    // saiu do mesmo jeito, entao a resposta e de sucesso, sem a conversa.)
+    const fresh = await WaChat.findById(chat._id).lean();
     return res.status(201).json({
       message: messageDto(message),
       loan: charge ? charge.loan : null,
-      chat: await oneChatDto(await WaChat.findById(chat._id).lean()),
+      chat: fresh ? await oneChatDto(fresh) : null,
     });
   } catch (error) {
     return sendError(res, error) || next(error);
@@ -616,7 +654,9 @@ router.post('/chats/:id/attendance', writeLimiter, async (req, res, next) => {
         }
       );
     }
-    return res.json({ chat: await oneChatDto(await WaChat.findById(chat._id).lean()) });
+    const fresh = await WaChat.findById(chat._id).lean();
+    if (!fresh) return res.status(404).json({ error: 'Conversa não encontrada.' });
+    return res.json({ chat: await oneChatDto(fresh) });
   } catch (error) {
     return next(error);
   }
@@ -641,6 +681,31 @@ router.post('/chats/:id/read', writeLimiter, async (req, res, next) => {
         .lean();
       await whatsapp.sendReadReceipts(chat, recent.map((m) => m.waId));
     }
+    return res.json({ ok: true, unread: await totalUnread() });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// DELETE /api/whatsapp/chats/:id - apaga a conversa DO PAINEL (para todos os
+// administradores): a conversa e as mensagens dela saem do banco. No celular
+// da biblioteca e no da pessoa nada muda. Se a pessoa escrever de novo, a
+// conversa volta, so com o que chegar dali em diante.
+router.delete('/chats/:id', writeLimiter, async (req, res, next) => {
+  try {
+    // Apaga primeiro: dois pedidos ao mesmo tempo, so um apaga (e conta).
+    const chat = await WaChat.findOneAndDelete({ _id: req.params.id }).select('_id').lean();
+    if (!chat) return res.status(404).json({ error: 'Conversa não encontrada.' });
+    // Os envios de hoje continuam contando nos tetos diarios (protecao do numero).
+    await whatsapp.keepSendCounts(chat._id);
+    const { deletedCount = 0 } = await WaMessage.deleteMany({ chat: chat._id });
+    console.warn(
+      'WhatsApp: conversa apagada do painel por ' +
+        req.account.fullName +
+        ' (' +
+        deletedCount +
+        (deletedCount === 1 ? ' mensagem).' : ' mensagens).')
+    );
     return res.json({ ok: true, unread: await totalUnread() });
   } catch (error) {
     return next(error);

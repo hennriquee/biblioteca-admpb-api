@@ -8,6 +8,7 @@ import makeWASocket, {
   proto,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
+import Setting from '../../models/Setting.js';
 import WaAuth from '../../models/WaAuth.js';
 import WaChat from '../../models/WaChat.js';
 import WaMessage from '../../models/WaMessage.js';
@@ -23,6 +24,7 @@ import {
 import {
   markDeleted,
   markEdited,
+  noteEphemeral,
   raiseStatus,
   resolveChat,
   saveMessage,
@@ -68,6 +70,8 @@ export class WhatsAppError extends Error {
 }
 
 const FALSY = new Set(['false', '0', 'no', 'off', 'nao', 'não']);
+// (settings) Envios das ultimas 24 h de conversas apagadas: ver keepSendCounts.
+const SENT_LOG = 'whatsapp-sent-log';
 
 /**
  * Ligado por padrao SO no Render (que define RENDER=true): em qualquer outro
@@ -82,9 +86,25 @@ function isEnabled(env) {
   return Boolean(String(env.RENDER ?? '').trim());
 }
 
+/**
+ * MENSAGENS TEMPORARIAS (WHATSAPP_DISAPPEAR_DAYS, padrao 7): cada mensagem
+ * some do painel esse tanto de dias depois de enviada, como no WhatsApp da
+ * biblioteca. 0 = o painel guarda para sempre. (Minimo de 1 dia: os tetos
+ * diarios de envio contam as mensagens das ultimas 24 h.)
+ */
+export function readDisappearDays(env = process.env) {
+  const raw = String(env.WHATSAPP_DISAPPEAR_DAYS ?? '').trim();
+  if (!raw) return 7;
+  const days = Number(raw.replace(',', '.'));
+  if (!Number.isFinite(days) || days < 0) return 7;
+  return days > 0 && days < 1 ? 1 : days;
+}
+
 export function readConfig(env = process.env) {
   const number = digitsOf(env.WHATSAPP_NUMBER || '5491164610665');
   return {
+    // Dias ate cada mensagem sumir do painel (0 = nunca).
+    disappearDays: readDisappearDays(env),
     enabled: isEnabled(env),
     // O numero da biblioteca: +54 9 11 6461-0665.
     number,
@@ -772,8 +792,17 @@ export class WhatsAppService {
     }
   }
 
+  // Mensagem mais velha que isto ja sumiu (mensagens temporarias): nem entra.
+  #disappearCutoff() {
+    const days = this.#cfg.disappearDays;
+    return days > 0 ? Date.now() - days * 24 * 60 * 60 * 1000 : 0;
+  }
+
   async #onHistory(sock, { messages }) {
-    const oldest = Date.now() - this.#cfg.historyDays * 24 * 60 * 60 * 1000;
+    const oldest = Math.max(
+      Date.now() - this.#cfg.historyDays * 24 * 60 * 60 * 1000,
+      this.#disappearCutoff()
+    );
     let count = 0;
     for (const message of messages || []) {
       if (count >= this.#cfg.historyMax) break;
@@ -799,14 +828,19 @@ export class WhatsAppService {
     if (identity.phone && samePhone(identity.phone, this.#cfg.number)) return;
 
     const info = describeMessage(message);
-    if (info.revokeId || info.edit) {
+    const at = toMs(message.messageTimestamp);
+    if (info.revokeId || info.edit || info.ephemeral !== undefined) {
       const chat = await resolveChat({ ...identity, create: false });
       if (!chat) return;
       if (info.revokeId) await markDeleted(chat._id, info.revokeId);
-      else await markEdited(chat._id, info.edit.id, info.edit.text);
+      else if (info.edit) await markEdited(chat._id, info.edit.id, info.edit.text);
+      // Alguem trocou o temporizador de mensagens temporarias da conversa.
+      else await noteEphemeral(chat._id, info.ephemeral, at);
       return;
     }
     if (info.skip) return;
+    // Ja teria sumido (mensagens temporarias): nao entra no painel.
+    if (at < this.#disappearCutoff()) return;
 
     const fromMe = Boolean(key.fromMe);
     const chat = await resolveChat({
@@ -820,13 +854,19 @@ export class WhatsAppService {
       fromMe,
       kind: info.kind,
       text: info.text,
-      at: toMs(message.messageTimestamp),
+      at,
       // (0 = erro vale; sem status, "enviada")
       status: fromMe && Number.isInteger(message.status) ? message.status : 2,
       // Mensagem recebida enquanto o servidor dormia chega como "append": conta
       // do mesmo jeito. O historico do vinculo nao conta.
       countUnread: !history && !fromMe,
     });
+    // O temporizador que a mensagem trouxe vale para os proximos envios. (O eco
+    // das mensagens que ESTE servidor enviou nao ensina nada: so repete o que
+    // o proprio servidor escolheu.)
+    if (Number.isFinite(info.expiration) && !(fromMe && this.#ownIds.has(key.id))) {
+      await noteEphemeral(chat._id, info.expiration, at).catch(() => {});
+    }
 
     // So o que e novo e ao vivo vai para o atendimento automatico. O eco das
     // mensagens enviadas por este servidor nao conta como "escrita no celular".
@@ -937,22 +977,68 @@ export class WhatsAppService {
     throw new WhatsAppError('NO_ADDRESS', 'Essa conversa não tem número para enviar.', 422);
   }
 
+  // Envios das ultimas 24 h de conversas APAGADAS do painel (os tetos diarios
+  // contam as mensagens do banco; sem isto, apagar conversas liberaria o teto).
+  async #deletedSends(kind, since) {
+    const doc = await Setting.findById(SENT_LOG).lean();
+    const list = Array.isArray(doc?.value) ? doc.value : [];
+    return list.filter((entry) => entry?.kind === kind && new Date(entry.at) >= since).length;
+  }
+
+  /**
+   * Antes de apagar uma conversa: guarda quantas mensagens o painel e o
+   * sistema mandaram nela nas ultimas 24 h, para continuarem contando nos tetos.
+   */
+  async keepSendCounts(chatId) {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const recent = await WaMessage.find({ chat: chatId, fromMe: true, at: { $gte: since } })
+      .select('at sentBy auto')
+      .lean();
+    const entries = recent.flatMap((message) =>
+      message.auto
+        ? [{ at: message.at, kind: 'auto' }]
+        : message.sentBy
+          ? [{ at: message.at, kind: 'panel' }]
+          : []
+    );
+    if (entries.length) {
+      // (registro estragado - nao e lista - recomeca vazio, senao o $push falha)
+      await Setting.updateOne(
+        { _id: SENT_LOG, value: { $not: { $type: 'array' } } },
+        { $set: { value: [] } }
+      );
+      await Setting.updateOne(
+        { _id: SENT_LOG },
+        { $push: { value: { $each: entries } } },
+        { upsert: true }
+      );
+    }
+    await Setting.updateOne(
+      { _id: SENT_LOG, value: { $type: 'array' } },
+      { $pull: { value: { at: { $lt: since } } } }
+    );
+  }
+
   /** Quantas mensagens o painel enviou nas ultimas 24 horas. */
   async sentToday() {
-    return WaMessage.countDocuments({
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const count = await WaMessage.countDocuments({
       fromMe: true,
       sentBy: { $ne: null },
-      at: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+      at: { $gte: since },
     });
+    return count + (await this.#deletedSends('panel', since));
   }
 
   /** Quantas mensagens automaticas (robo, avisos) sairam nas ultimas 24 horas. */
   async autoSentToday() {
-    return WaMessage.countDocuments({
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const count = await WaMessage.countDocuments({
       fromMe: true,
       auto: { $nin: ['', null] },
-      at: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+      at: { $gte: since },
     });
+    return count + (await this.#deletedSends('auto', since));
   }
 
   isOpen() {
@@ -982,6 +1068,20 @@ export class WhatsAppService {
   }
 
   /**
+   * O temporizador de mensagens temporarias com que se escreve nesta conversa
+   * (segundos; 0 = sem): o que as mensagens dela ensinaram (a troca do
+   * temporizador que o celular sincroniza, ou o que veio nas mensagens). Sem
+   * isso, 0: nao mexe na conversa. (O temporizador padrao do WhatsApp
+   * Business so vale para conversas NOVAS; as antigas, sem temporizador,
+   * mandam texto simples, que nao diz nada - chutar 7 dias ai mandaria
+   * mensagem temporaria numa conversa comum.)
+   */
+  ephemeralFor(chat) {
+    const known = chat?.ephemeral;
+    return typeof known === 'number' && Number.isFinite(known) && known > 0 ? known : 0;
+  }
+
+  /**
    * Envia o texto e devolve o id da mensagem no WhatsApp.
    * auto: "bot" | "overdue" | "handoff" para mensagens do proprio sistema
    * (contam no teto das automaticas, nao no do painel).
@@ -997,7 +1097,7 @@ export class WhatsAppService {
     let sent;
     try {
       sent = await withTimeout(
-        sock.sendMessage(jid, { text }, { messageId }),
+        sock.sendMessage(jid, { text }, { messageId, ephemeralExpiration: this.ephemeralFor(chat) }),
         this.#cfg.sendTimeoutMs,
         'SEND_TIMEOUT',
         'O WhatsApp não confirmou o envio a tempo. Confira na conversa se a mensagem saiu.'

@@ -69,6 +69,14 @@ const waChatSchema = new mongoose.Schema(
     botDayCount: { type: Number, default: 0 },
     // Estourou o freio: o robo fica mudo nesta conversa ate esta hora.
     botMutedUntil: { type: Date, default: null },
+
+    // MENSAGENS TEMPORARIAS: o temporizador desta conversa no WhatsApp, em
+    // segundos (0 = desligado; null = ainda nao se sabe), aprendido das
+    // mensagens dela, e a hora da mensagem de onde veio (so uma mais nova
+    // troca). O painel e o robo enviam com ele, para as mensagens deles
+    // sumirem do celular junto com as outras.
+    ephemeral: { type: Number, default: null },
+    ephemeralAt: { type: Date, default: null },
   },
   { collection: 'wa_chats', timestamps: true }
 );

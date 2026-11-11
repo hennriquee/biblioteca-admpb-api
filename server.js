@@ -20,9 +20,13 @@ import whatsappRoutes from "./src/routes/whatsapp.js";
 import { whatsapp } from "./src/services/whatsapp/service.js";
 import { bot as whatsappBot } from "./src/services/whatsapp/bot.js";
 import { createOverdueReminders } from "./src/services/whatsapp/overdue.js";
+import { createRetention } from "./src/services/whatsapp/retention.js";
 
 // Aviso automatico de atraso pelo WhatsApp (services/whatsapp/overdue.js).
 const overdueReminders = createOverdueReminders({ whatsapp, bot: whatsappBot });
+// Mensagens temporarias: o painel apaga as mensagens com mais de 7 dias, como
+// o WhatsApp da biblioteca (services/whatsapp/retention.js).
+const whatsappRetention = createRetention({ whatsapp });
 import requestRoutes, {
   ogPreviewHandler,
   publicRequests,
@@ -435,6 +439,7 @@ function shutDown(signal) {
   });
   whatsappBot.stop();
   overdueReminders.stop();
+  whatsappRetention.stop();
   Promise.race([drained, wait(8000)])
     .then(() => Promise.race([whatsapp.shutdown(), wait(5000)]))
     .catch(() => {})
@@ -457,6 +462,7 @@ connectDatabase()
       // WhatsApp conectado neste servidor.
       whatsappBot.start();
       overdueReminders.start();
+      whatsappRetention.start();
     });
   })
   .catch((error) => {
