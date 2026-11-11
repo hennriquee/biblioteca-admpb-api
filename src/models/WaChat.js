@@ -39,6 +39,26 @@ const waChatSchema = new mongoose.Schema(
     // abrir a conversa zera para todos).
     unread: { type: Number, default: 0 },
     readAt: { type: Date, default: null },
+
+    // ATENDIMENTO (services/whatsapp/bot.js). "bot": o atendimento automatico
+    // responde; "human": um administrador esta conversando e o robo fica quieto
+    // ate humanUntil (ou ate alguem devolver a conversa ao robo no painel).
+    // handoffAt: quando a pessoa pediu para falar com um administrador (vazio
+    // depois que alguem responde ou devolve ao robo).
+    mode: { type: String, enum: ['bot', 'human'], default: 'bot' },
+    humanUntil: { type: Date, default: null },
+    handoffAt: { type: Date, default: null, index: true },
+    // Onde a pessoa esta no menu do robo (step + dados do passo) e ate quando.
+    botStep: { type: String, default: '' },
+    botData: { type: mongoose.Schema.Types.Mixed, default: null },
+    botAt: { type: Date, default: null },
+    // Freio contra conversa sem fim com outro robo: respostas na janela atual.
+    botWindowAt: { type: Date, default: null },
+    botWindowCount: { type: Number, default: 0 },
+    botDayAt: { type: Date, default: null },
+    botDayCount: { type: Number, default: 0 },
+    // Estourou o freio: o robo fica mudo nesta conversa ate esta hora.
+    botMutedUntil: { type: Date, default: null },
   },
   { collection: 'wa_chats', timestamps: true }
 );

@@ -30,6 +30,17 @@ async function mergeChats(from, into) {
     set.lastMessageKind = last.kind;
     set.lastMessageFromMe = last.fromMe;
   }
+  // Atendimento humano em curso na conversa que some passa para a que fica
+  // (senao o "Aguardando administrador" sumiria e o robo responderia no meio).
+  const fromUntil = from.humanUntil ? new Date(from.humanUntil).getTime() : 0;
+  const intoUntil = into.humanUntil ? new Date(into.humanUntil).getTime() : 0;
+  if (from.mode === 'human' && fromUntil > Date.now() && fromUntil > intoUntil) {
+    set.mode = 'human';
+    set.humanUntil = from.humanUntil;
+    if (from.handoffAt) set.handoffAt = from.handoffAt;
+  } else if (from.handoffAt && into.mode === 'human' && !into.handoffAt) {
+    set.handoffAt = from.handoffAt;
+  }
   await WaChat.updateOne(
     { _id: into._id },
     { $set: set, $inc: { unread: from.unread || 0 } }
@@ -131,6 +142,7 @@ export async function saveMessage(
     sentBy = null,
     sentByName = '',
     chargeLoan = null,
+    auto = '',
     countUnread = false,
   }
 ) {
@@ -141,17 +153,21 @@ export async function saveMessage(
     set.sentByName = sentByName;
   }
   if (chargeLoan) set.chargeLoan = chargeLoan;
+  if (auto) {
+    set.auto = auto;
+    set.sentByName = sentByName;
+  }
 
-  const update = {
-    $setOnInsert: { fromMe, kind, text, at: when },
-    $max: { status },
-  };
+  // O status entra so na criacao; depois so muda por raiseStatus (que sabe
+  // tratar o "erro", que e menor que "enviada" mas tem de valer).
+  const update = { $setOnInsert: { fromMe, kind, text, at: when, status } };
   if (Object.keys(set).length) update.$set = set;
 
   const result = await WaMessage.updateOne({ chat: chat._id, waId }, update, {
     upsert: true,
   });
   const inserted = result.upsertedCount === 1;
+  if (!inserted && fromMe) await raiseStatus(chat._id, waId, status);
 
   if (inserted) {
     await WaChat.updateOne(
@@ -180,12 +196,35 @@ export async function saveMessage(
   return { inserted, message };
 }
 
-/** O status de entrega so sobe (enviada -> entregue -> lida). */
-export async function raiseStatus(chatId, waId, status) {
-  await WaMessage.updateOne(
-    { chat: chatId, waId, fromMe: true },
-    { $max: { status } }
+/**
+ * Status de entrega das mensagens da biblioteca. Sobe (enviando -> enviada ->
+ * entregue -> lida), com uma excecao: o ERRO (0). O WhatsApp avisa do erro
+ * DEPOIS de aceitar o envio (o servidor dele recusou ou o aparelho nao abriu
+ * a mensagem); antes isso era descartado, porque 0 < 2, e o painel seguia
+ * mostrando "enviada" para uma mensagem que nunca chegou.
+ * - erro: vale se a mensagem ainda nao foi entregue;
+ * - enviando/enviada: nao apagam um erro;
+ * - entregue/lida: valem sempre (a mensagem chegou, mesmo depois de um erro).
+ * @returns {Promise<boolean>} se a mensagem existe (para tentar de novo se nao).
+ */
+export async function raiseStatus(chatId, waId, status, errorCode = '') {
+  const filter = { chat: chatId, waId, fromMe: true };
+  if (status === 0) {
+    const result = await WaMessage.updateOne(
+      { ...filter, status: { $lt: 3 } },
+      { $set: { status: 0, errorCode: String(errorCode || '').slice(0, 40) } }
+    );
+    if (result.matchedCount) return true;
+    return Boolean(await WaMessage.exists(filter));
+  }
+  const result = await WaMessage.updateOne(
+    status >= 3
+      ? { ...filter, status: { $lt: status } }
+      : { ...filter, status: { $gt: 0, $lt: status } },
+    { $set: { status } }
   );
+  if (result.matchedCount) return true;
+  return Boolean(await WaMessage.exists(filter));
 }
 
 export async function markDeleted(chatId, waId) {

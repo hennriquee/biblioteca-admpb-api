@@ -1,6 +1,7 @@
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
+  generateMessageIDV2,
   isLidUser,
   isPnUser,
   makeCacheableSignalKeyStore,
@@ -50,6 +51,12 @@ import {
  *
  * Seguranca: o numero aceito vem do servidor (WHATSAPP_NUMBER) e nunca do
  * front; a sessao nunca e apagada por engano; nada sensivel vai para o log.
+ *
+ * NUMERO FIXO: o painel NAO desconecta o WhatsApp (nao ha rota nem metodo para
+ * isso). A sessao so e apagada quando ela ja nao serve mais: o proprio celular
+ * desvinculou o aparelho (logged-out), alguem leu o QR com outro numero
+ * (wrong-number) ou a sessao salva quebrou de vez (recoverBrokenSession, que
+ * so funciona nesse caso). Fora isso, o servidor reconecta sozinho, sempre.
  */
 
 export class WhatsAppError extends Error {
@@ -98,6 +105,12 @@ export function readConfig(env = process.env) {
     historyMax: 5000,
     // De quanto em quanto tempo confere de novo se o numero tem WhatsApp.
     recheckMs: 30 * 24 * 60 * 60 * 1000,
+    // Conexao recusada (erro) com sessao salva: tenta de novo devagar, para
+    // voltar sozinho quando o problema passar.
+    slowRetryMs: 10 * 60 * 1000,
+    // Teto das mensagens AUTOMATICAS (robo de atendimento, avisos) em 24 h.
+    autoDailyLimit:
+      Number(env.WHATSAPP_AUTO_DAILY_LIMIT) > 0 ? Number(env.WHATSAPP_AUTO_DAILY_LIMIT) : 500,
   };
 }
 
@@ -171,6 +184,13 @@ export class WhatsAppService {
   #heartbeat = null;
   #queue = Promise.resolve();
   #historyQueue = Promise.resolve();
+  // A sessao salva quebrou de vez (ilegivel ou recusada varias vezes): so ai
+  // recoverBrokenSession pode apaga-la.
+  #broken = false;
+  // Ids das mensagens que ESTE servidor enviou (painel, robo, avisos), para o
+  // eco delas nao parecer mensagem escrita no celular.
+  #ownIds = new Map();
+  #listeners = new Set();
 
   constructor(overrides = {}) {
     this.#init(overrides);
@@ -221,6 +241,8 @@ export class WhatsAppService {
       connected: this.#state === 'open',
       qr: this.#state === 'qr' ? this.#qr : null,
       hasSession: Boolean(this.#auth?.state?.creds?.me),
+      // Sessao quebrada: o painel oferece apagar e ler o QR de novo.
+      broken: this.#broken,
       number: this.#cfg.number,
       notice: this.#notice,
       since: new Date(this.#since).toISOString(),
@@ -269,11 +291,12 @@ export class WhatsAppService {
       const auth = this.#auth?.state ? this.#auth : await this.#authFactory();
       if (auth.status === 'unreadable') {
         this.#auth = auth;
+        this.#broken = true;
         this.#stopHeartbeat();
         await this.#lease.release().catch(() => {});
         this.#setState(
           'unreadable',
-          'A sessão salva não pôde ser lida (a chave de segurança mudou). Desconecte para apagá-la e leia o QR de novo.'
+          'A sessão salva não pôde ser lida (a chave de segurança mudou). Apague a sessão e leia o QR de novo.'
         );
         return this.snapshot();
       }
@@ -282,7 +305,10 @@ export class WhatsAppService {
     } catch (error) {
       console.error('WhatsApp: falha ao conectar:', error.message);
       this.#teardownSocket();
-      if (this.#auth?.state?.creds?.me) {
+      // auto: veio da subida do servidor (com sessao salva) ou de uma nova
+      // tentativa. Se o banco falhou ao ler a sessao, tenta de novo sozinho em
+      // vez de ficar parado ate alguem abrir o painel.
+      if (this.#auth?.state?.creds?.me || auto) {
         this.#setState('reconnecting', 'Não foi possível conectar agora. Tentando de novo.');
         this.#scheduleRetry(this.#backoff());
       } else {
@@ -395,6 +421,8 @@ export class WhatsAppService {
   }
 
   async #onOpen(gen, sock) {
+    // Aviso atrasado de um socket que ja caiu: nao vale como conectado.
+    if (sock !== this.#sock) return;
     const me = sock.user?.id || this.#auth?.state?.creds?.me?.id || '';
     const meDigits = phoneFromJid(me);
     if (!meDigits) {
@@ -404,8 +432,9 @@ export class WhatsAppService {
       await this.#lease.release().catch(() => {});
       this.#setState(
         'error',
-        'Não foi possível confirmar qual número está conectado. Tente conectar de novo.'
+        'Não foi possível confirmar qual número está conectado. O servidor tenta de novo sozinho.'
       );
+      this.#scheduleRetry(this.#cfg.slowRetryMs);
       return;
     }
     if (!samePhone(meDigits, this.#cfg.number)) {
@@ -413,6 +442,7 @@ export class WhatsAppService {
       return;
     }
     this.#attempts = 0;
+    this.#broken = false;
     this.#setState('open');
   }
 
@@ -466,12 +496,14 @@ export class WhatsAppService {
     // vezes antes de desistir (e mesmo assim NAO apaga a sessao sozinho).
     if (code === DisconnectReason.badSession) {
       if (this.#attempts >= 5) {
+        this.#broken = true;
         this.#stopHeartbeat();
         await this.#lease.release().catch(() => {});
         this.#setState(
           'error',
-          'O WhatsApp recusou a sessão salva. Desconecte e leia o QR code de novo.'
+          'O WhatsApp recusou a sessão salva várias vezes. O servidor segue tentando; se não voltar, apague a sessão e leia o QR code de novo.'
         );
+        this.#scheduleRetry(this.#cfg.slowRetryMs);
       } else {
         this.#setState('reconnecting', 'A conexão caiu. Reconectando…');
         this.#scheduleRetry(this.#backoff());
@@ -495,8 +527,9 @@ export class WhatsAppService {
       await this.#lease.release().catch(() => {});
       this.#setState(
         'error',
-        'O WhatsApp recusou a conexão. A conta pode estar restrita; confira o aplicativo no celular.'
+        'O WhatsApp recusou a conexão. A conta pode estar restrita; confira o aplicativo no celular. O servidor tenta de novo sozinho.'
       );
+      this.#scheduleRetry(this.#cfg.slowRetryMs);
       return;
     }
 
@@ -525,6 +558,7 @@ export class WhatsAppService {
     this.#teardownSocket();
     await this.#auth?.clear().catch(() => {});
     this.#auth = null;
+    this.#broken = false;
     this.#stopHeartbeat();
     await this.#lease.release().catch(() => {});
     this.#setState(state, notice);
@@ -607,10 +641,27 @@ export class WhatsAppService {
     if (this.#cfg.enabled) await this.#lease.release().catch(() => {});
   }
 
-  /** Pedido do administrador: desvincula o aparelho e apaga a sessao. */
-  async disconnect() {
+  /**
+   * Apaga a sessao salva SO quando ela ja nao serve (ilegivel ou recusada
+   * varias vezes pelo WhatsApp) e volta a mostrar o QR. Com a sessao boa -
+   * conectada, conectando, reconectando - recusa: o painel nao desconecta o
+   * numero da biblioteca.
+   */
+  async recoverBrokenSession() {
     if (!this.#cfg.enabled) {
       throw new WhatsAppError('DISABLED', 'O WhatsApp está desligado neste servidor.', 409);
+    }
+    if (
+      !this.#broken ||
+      !['unreadable', 'error'].includes(this.#state) ||
+      this.#sock ||
+      this.#connecting
+    ) {
+      throw new WhatsAppError(
+        'NOT_BROKEN',
+        'A sessão do WhatsApp não está quebrada: não há o que apagar. O servidor reconecta sozinho.',
+        409
+      );
     }
     if (!(await this.#lease.acquire())) {
       throw new WhatsAppError(
@@ -620,29 +671,16 @@ export class WhatsAppService {
       );
     }
     clearTimeout(this.#retryTimer);
-    const sock = this.#sock;
-    this.#gen += 1; // ignora o fechamento que vem a seguir
-    this.#sock = null;
-    this.#qr = null;
-    if (sock) {
-      try {
-        await withTimeout(sock.logout('desconectado pelo painel'), 8000);
-      } catch {
-        try {
-          sock.end(undefined);
-        } catch {
-          /* ja fechado */
-        }
-      }
-    }
+    console.warn('WhatsApp: sessão quebrada apagada para ler o QR de novo.');
     const auth = this.#auth || (await this.#authFactory());
     await auth.clear();
     this.#auth = null;
+    this.#broken = false;
     this.#attempts = 0;
     this.#stopHeartbeat();
     await this.#lease.release().catch(() => {});
-    this.#setState('idle', 'O WhatsApp foi desconectado. Leia o QR code para conectar de novo.');
-    return this.snapshot();
+    this.#setState('idle', 'A sessão foi apagada. Leia o QR code para conectar.');
+    return this.connect();
   }
 
   /** Codigo de 8 letras para digitar no WhatsApp, no lugar de ler o QR. */
@@ -660,6 +698,41 @@ export class WhatsAppService {
     }
     // Sempre o numero da biblioteca: o painel nao escolhe numero nenhum.
     return withTimeout(sock.requestPairingCode(this.#cfg.number), 20 * 1000);
+  }
+
+  // ---------- Avisos para quem usa o servico (robo de atendimento) ----------
+
+  /**
+   * fn({ type, chat, message, text, kind }) para cada mensagem NOVA ao vivo:
+   * - "incoming": a pessoa escreveu;
+   * - "phone-out": a biblioteca escreveu pelo CELULAR (nao pelo painel/robo).
+   * Devolve a funcao que cancela.
+   */
+  onEvent(fn) {
+    this.#listeners.add(fn);
+    return () => this.#listeners.delete(fn);
+  }
+
+  #emit(event) {
+    for (const fn of this.#listeners) {
+      try {
+        Promise.resolve(fn(event)).catch((error) => {
+          console.error('WhatsApp: erro no atendimento automático:', error.message);
+        });
+      } catch (error) {
+        console.error('WhatsApp: erro no atendimento automático:', error.message);
+      }
+    }
+  }
+
+  #rememberOwn(id) {
+    const now = Date.now();
+    this.#ownIds.set(id, now);
+    if (this.#ownIds.size > 500) {
+      for (const [key, at] of this.#ownIds) {
+        if (now - at > 10 * 60 * 1000) this.#ownIds.delete(key);
+      }
+    }
   }
 
   // ---------- Receber ----------
@@ -736,17 +809,33 @@ export class WhatsAppService {
       authoritative: true,
     });
     if (!chat) return;
-    await saveMessage(chat, {
+    const { inserted, message: saved } = await saveMessage(chat, {
       waId: key.id,
       fromMe,
       kind: info.kind,
       text: info.text,
       at: toMs(message.messageTimestamp),
-      status: fromMe ? Number(message.status) || 2 : 2,
+      // (0 = erro vale; sem status, "enviada")
+      status: fromMe && Number.isInteger(message.status) ? message.status : 2,
       // Mensagem recebida enquanto o servidor dormia chega como "append": conta
       // do mesmo jeito. O historico do vinculo nao conta.
       countUnread: !history && !fromMe,
     });
+
+    // So o que e novo e ao vivo vai para o atendimento automatico. O eco das
+    // mensagens enviadas por este servidor nao conta como "escrita no celular".
+    if (history || !inserted) return;
+    if (!fromMe) {
+      this.#emit({
+        type: 'incoming',
+        chat,
+        message: saved,
+        text: info.text || '',
+        kind: info.kind,
+      });
+    } else if (!this.#ownIds.has(key.id)) {
+      this.#emit({ type: 'phone-out', chat, message: saved });
+    }
   }
 
   async #onUpdates(sock, updates) {
@@ -754,6 +843,14 @@ export class WhatsAppService {
       try {
         if (!key?.id || !key.remoteJid) continue;
         if (!isPnUser(key.remoteJid) && !isLidUser(key.remoteJid)) continue;
+
+        // Entrega/leitura/erro das mensagens da biblioteca: acha pelo id da
+        // mensagem (o aviso pode vir pelo LID e a conversa estar pelo numero).
+        if (typeof update?.status === 'number' && key.fromMe && !update.message) {
+          await this.#onStatus(key.id, update);
+          continue;
+        }
+
         const identity = await this.#identity(sock, key);
         if (!identity) continue;
         const chat = await resolveChat({ ...identity, create: false });
@@ -764,12 +861,33 @@ export class WhatsAppService {
         } else if (update?.message?.editedMessage?.message) {
           const edited = describeMessage({ message: update.message.editedMessage.message });
           if (!edited.skip) await markEdited(chat._id, key.id, edited.text || '');
-        } else if (typeof update?.status === 'number' && key.fromMe) {
-          await raiseStatus(chat._id, key.id, update.status);
         }
       } catch (error) {
         console.error('WhatsApp: atualização ignorada:', error.message);
       }
+    }
+  }
+
+  async #onStatus(waId, update) {
+    const status = update.status;
+    const errorCode = status === 0 ? String(update.messageStubParameters?.[0] || '') : '';
+    if (status === 0) {
+      // Antes isso sumia: o painel mostrava "enviada" para mensagem recusada.
+      console.warn(
+        'WhatsApp: o WhatsApp recusou uma mensagem' +
+          (errorCode ? ' (código ' + errorCode + ')' : '') +
+          '.'
+      );
+    }
+    const apply = async () => {
+      const found = await WaMessage.findOne({ waId, fromMe: true }).select('chat').lean();
+      if (!found) return false;
+      return raiseStatus(found.chat, waId, status, errorCode);
+    };
+    // O aviso pode chegar antes de a mensagem enviada ser gravada: tenta de novo.
+    if (!(await apply()) && status === 0) {
+      const timer = setTimeout(() => apply().catch(() => {}), 4000);
+      timer.unref?.();
     }
   }
 
@@ -822,9 +940,32 @@ export class WhatsAppService {
     });
   }
 
+  /** Quantas mensagens automaticas (robo, avisos) sairam nas ultimas 24 horas. */
+  async autoSentToday() {
+    return WaMessage.countDocuments({
+      fromMe: true,
+      auto: { $nin: ['', null] },
+      at: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+    });
+  }
+
+  isOpen() {
+    return this.#state === 'open' && Boolean(this.#sock);
+  }
+
   /** Confere (sem enviar) se da para enviar agora; lanca o erro se nao. */
-  async assertCanSend() {
+  async assertCanSend({ auto = '' } = {}) {
     this.#requireOpen();
+    if (auto) {
+      if ((await this.autoSentToday()) >= this.#cfg.autoDailyLimit) {
+        throw new WhatsAppError(
+          'AUTO_DAILY_LIMIT',
+          'O limite diário de mensagens automáticas foi atingido.',
+          429
+        );
+      }
+      return;
+    }
     if ((await this.sentToday()) >= this.#cfg.dailyLimit) {
       throw new WhatsAppError(
         'DAILY_LIMIT',
@@ -834,15 +975,23 @@ export class WhatsAppService {
     }
   }
 
-  /** Envia o texto e devolve o id da mensagem no WhatsApp. */
-  async sendText(chat, text) {
-    await this.assertCanSend();
+  /**
+   * Envia o texto e devolve o id da mensagem no WhatsApp.
+   * auto: "bot" | "overdue" | "handoff" para mensagens do proprio sistema
+   * (contam no teto das automaticas, nao no do painel).
+   */
+  async sendText(chat, text, { auto = '' } = {}) {
+    await this.assertCanSend({ auto });
     const sock = this.#requireOpen();
     const jid = await this.#targetJid(sock, chat);
+    // O id e escolhido aqui (e lembrado ANTES de enviar): o eco da mensagem
+    // chega antes de o envio terminar.
+    const messageId = generateMessageIDV2(sock.user?.id);
+    this.#rememberOwn(messageId);
     let sent;
     try {
       sent = await withTimeout(
-        sock.sendMessage(jid, { text }),
+        sock.sendMessage(jid, { text }, { messageId }),
         this.#cfg.sendTimeoutMs,
         'SEND_TIMEOUT',
         'O WhatsApp não confirmou o envio a tempo. Confira na conversa se a mensagem saiu.'

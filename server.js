@@ -18,6 +18,11 @@ import notificationRoutes from "./src/routes/notifications.js";
 import captchaRoutes from "./src/routes/captcha.js";
 import whatsappRoutes from "./src/routes/whatsapp.js";
 import { whatsapp } from "./src/services/whatsapp/service.js";
+import { bot as whatsappBot } from "./src/services/whatsapp/bot.js";
+import { createOverdueReminders } from "./src/services/whatsapp/overdue.js";
+
+// Aviso automatico de atraso pelo WhatsApp (services/whatsapp/overdue.js).
+const overdueReminders = createOverdueReminders({ whatsapp, bot: whatsappBot });
 import requestRoutes, {
   ogPreviewHandler,
   publicRequests,
@@ -428,6 +433,8 @@ function shutDown(signal) {
     httpServer.closeIdleConnections?.();
     return undefined;
   });
+  whatsappBot.stop();
+  overdueReminders.stop();
   Promise.race([drained, wait(8000)])
     .then(() => Promise.race([whatsapp.shutdown(), wait(5000)]))
     .catch(() => {})
@@ -446,6 +453,10 @@ connectDatabase()
       // Reconecta o WhatsApp da biblioteca se ja houver sessao salva. Roda em
       // segundo plano: nao segura a subida do servidor.
       whatsapp.start();
+      // Atendimento automatico (menu) e aviso de atraso: so agem com o
+      // WhatsApp conectado neste servidor.
+      whatsappBot.start();
+      overdueReminders.start();
     });
   })
   .catch((error) => {

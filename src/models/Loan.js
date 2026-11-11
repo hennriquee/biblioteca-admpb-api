@@ -33,6 +33,10 @@ const loanSchema = new mongoose.Schema(
       default: null,
     },
     overdueSentByName: { type: String, default: '' },
+    // AVISO AUTOMATICO de atraso pelo WhatsApp (services/whatsapp/overdue.js):
+    // para qual prazo ja foi mandado (um aviso por prazo vencido) e quando.
+    overdueAutoFor: { type: Date, default: null },
+    overdueAutoAt: { type: Date, default: null },
 
     // Prazos estendidos, do mais antigo ao mais novo: de que data (from) para
     // qual (to), quando e por quem. dueDate ja e sempre o prazo de agora.
@@ -45,6 +49,8 @@ const loanSchema = new mongoose.Schema(
           at: { type: Date, required: true },
           by: { type: mongoose.Schema.Types.ObjectId, ref: 'Person', default: null },
           byName: { type: String, default: '' },
+          // "whatsapp": a propria pessoa estendeu pelo atendimento automatico.
+          via: { type: String, default: '' },
         },
       ],
       default: [],

@@ -34,6 +34,11 @@ const waMessageSchema = new mongoose.Schema(
       default: null,
     },
     sentByName: { type: String, default: '' },
+    // Mensagem que o proprio sistema mandou: "bot" (atendimento automatico),
+    // "overdue" (aviso de atraso) ou "handoff" (aviso ao administrador).
+    auto: { type: String, default: '' },
+    // Por que o WhatsApp recusou (status 0): o codigo que ele devolveu.
+    errorCode: { type: String, default: '' },
     // Se foi a cobranca de atraso de um emprestimo.
     chargeLoan: {
       type: mongoose.Schema.Types.ObjectId,

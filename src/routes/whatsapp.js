@@ -10,6 +10,7 @@ import { normalizeText } from '../models/Book.js';
 import { allWordsRegex, escapeRegex } from '../services/search.js';
 import { registerCharge, undoCharge } from '../services/charges.js';
 import { WhatsAppError, whatsapp } from '../services/whatsapp/service.js';
+import { bot } from '../services/whatsapp/bot.js';
 import { resolveChat, saveMessage } from '../services/whatsapp/store.js';
 import {
   canonicalPhone,
@@ -28,6 +29,8 @@ import {
  * - NAO existe rota para escrever para um numero digitado: so se envia para
  *   uma conversa que ja existe ou para uma pessoa/emprestimo do cadastro;
  * - o numero que pode ser vinculado e o da biblioteca, definido no servidor;
+ * - NAO existe rota para desconectar o WhatsApp: o numero fica fixo. So da
+ *   para apagar a sessao quando ela ja quebrou (/recover-session);
  * - envio com limite por administrador (e um teto diario geral).
  */
 
@@ -78,8 +81,8 @@ const sendLimiter = perAccount(
   60 * 1000,
   'Você enviou muitas mensagens em pouco tempo. Aguarde um minuto.'
 );
-// Conectar e desconectar falam com os servidores do WhatsApp (abrir a tela
-// sem conexao ja pede o QR, entao o limite e folgado).
+// Conectar fala com os servidores do WhatsApp (abrir a tela sem conexao ja
+// pede o QR, entao o limite e folgado).
 const linkLimiter = perAccount(
   20,
   10 * 60 * 1000,
@@ -106,6 +109,24 @@ function messageDto(message) {
     deleted: Boolean(message.deleted),
     sentByName: message.sentByName || '',
     charge: Boolean(message.chargeLoan),
+    // "bot" | "overdue" | "handoff": mensagem que o proprio sistema mandou.
+    auto: message.auto || '',
+    errorCode: message.status === 0 ? message.errorCode || '' : '',
+  };
+}
+
+// O robo esta quieto nesta conversa agora? (o modo humano vence sozinho)
+function attendanceOf(chat) {
+  const until = chat.humanUntil ? new Date(chat.humanUntil) : null;
+  const human = chat.mode === 'human' && until && until.getTime() > Date.now();
+  return {
+    mode: human ? 'human' : 'bot',
+    until: human ? until : null,
+    // Pediu um administrador e ninguem respondeu ainda.
+    waiting: Boolean(human && chat.handoffAt),
+    waitingSince: human && chat.handoffAt ? chat.handoffAt : null,
+    // O freio silenciou o robo aqui (muitas mensagens seguidas).
+    muted: Boolean(!human && chat.botMutedUntil && new Date(chat.botMutedUntil).getTime() > Date.now()),
   };
 }
 
@@ -151,6 +172,7 @@ function chatDto(chat, people) {
     lastMessageKind: chat.lastMessageKind || 'text',
     lastMessageFromMe: Boolean(chat.lastMessageFromMe),
     unread: chat.unread || 0,
+    attendance: attendanceOf(chat),
   };
 }
 
@@ -207,11 +229,14 @@ router.post('/pairing-code', codeLimiter, async (req, res, next) => {
   }
 });
 
-// POST /api/whatsapp/disconnect - desvincula o aparelho e apaga a sessao
-router.post('/disconnect', linkLimiter, async (req, res, next) => {
+// POST /api/whatsapp/recover-session - SO com a sessao quebrada (ilegivel ou
+// recusada pelo WhatsApp): apaga e mostra o QR de novo. Com a sessao boa, o
+// servico recusa (409): nao ha como desconectar o numero pelo painel.
+router.post('/recover-session', linkLimiter, async (req, res, next) => {
   try {
-    console.warn('WhatsApp: desconectado pelo painel por ' + req.account.fullName);
-    return res.json(await whatsapp.disconnect());
+    const snapshot = await whatsapp.recoverBrokenSession();
+    console.warn('WhatsApp: sessão quebrada apagada pelo painel por ' + req.account.fullName);
+    return res.json(snapshot);
   } catch (error) {
     return sendError(res, error) || next(error);
   }
@@ -485,12 +510,58 @@ router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
       };
     }
 
+    // Um administrador respondeu: o atendimento automatico fica quieto aqui.
+    await bot.humanTookOver(chat._id).catch((error) => {
+      console.error('WhatsApp: não foi possível pausar o atendimento automático:', error.message);
+    });
+
     return res.status(201).json({
       message: messageDto(message),
       loan: charge ? charge.loan : null,
+      chat: await oneChatDto(await WaChat.findById(chat._id).lean()),
     });
   } catch (error) {
     return sendError(res, error) || next(error);
+  }
+});
+
+// POST /api/whatsapp/chats/:id/attendance { mode: "human" | "bot" }
+// human: o administrador assume (o robo fica quieto por 12 h, renovadas a
+// cada resposta); bot: devolve a conversa ao atendimento automatico.
+router.post('/chats/:id/attendance', writeLimiter, async (req, res, next) => {
+  try {
+    const mode = req.body?.mode;
+    if (mode !== 'human' && mode !== 'bot') {
+      return res.status(400).json({ error: 'Escolha quem atende a conversa.' });
+    }
+    const chat = await WaChat.findById(req.params.id).select('_id').lean();
+    if (!chat) return res.status(404).json({ error: 'Conversa não encontrada.' });
+    if (mode === 'human') {
+      await bot.humanTookOver(chat._id);
+    } else {
+      await WaChat.updateOne(
+        { _id: chat._id },
+        {
+          $set: {
+            mode: 'bot',
+            humanUntil: null,
+            handoffAt: null,
+            botStep: '',
+            botData: null,
+            botAt: null,
+            // religar tambem desfaz o silencio do freio contra outro robo
+            botMutedUntil: null,
+            botWindowAt: null,
+            botWindowCount: 0,
+            botDayAt: null,
+            botDayCount: 0,
+          },
+        }
+      );
+    }
+    return res.json({ chat: await oneChatDto(await WaChat.findById(chat._id).lean()) });
+  } catch (error) {
+    return next(error);
   }
 });
 
