@@ -1,0 +1,878 @@
+import makeWASocket, {
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  isLidUser,
+  isPnUser,
+  makeCacheableSignalKeyStore,
+  proto,
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import WaAuth from '../../models/WaAuth.js';
+import WaChat from '../../models/WaChat.js';
+import WaMessage from '../../models/WaMessage.js';
+import { useMongoAuthState } from './authState.js';
+import { describeMessage } from './content.js';
+import { createLease } from './lease.js';
+import {
+  digitsOf,
+  lidFromJid,
+  phoneFromJid,
+  samePhone,
+} from './phone.js';
+import {
+  markDeleted,
+  markEdited,
+  raiseStatus,
+  resolveChat,
+  saveMessage,
+} from './store.js';
+
+/**
+ * A ligacao do painel com o WhatsApp da biblioteca (Baileys).
+ *
+ * O servidor entra no WhatsApp como um "aparelho conectado" do numero da
+ * biblioteca (o mesmo que o WhatsApp Web). O QR code so e lido UMA vez: a
+ * sessao fica guardada, cifrada, no MongoDB (authState.js) e o servidor volta
+ * sozinho a cada reinicio.
+ *
+ * Estados (state):
+ * - disabled      desligado neste servidor (WHATSAPP_ENABLED=false);
+ * - idle          sem conexao e sem tentativa em andamento (falta o QR);
+ * - standby       outra copia do servidor esta com a conexao (lease.js);
+ * - connecting    abrindo a conexao;
+ * - qr            esperando o QR (ou o codigo) ser lido no celular;
+ * - open          conectado;
+ * - reconnecting  caiu e vai tentar de novo;
+ * - logged-out    o celular desconectou este aparelho (precisa do QR);
+ * - wrong-number  alguem leu o QR com OUTRO numero: desfeito na hora;
+ * - unreadable    ha sessao salva, mas a chave de cifra mudou;
+ * - error         o WhatsApp recusou a conexao.
+ *
+ * Seguranca: o numero aceito vem do servidor (WHATSAPP_NUMBER) e nunca do
+ * front; a sessao nunca e apagada por engano; nada sensivel vai para o log.
+ */
+
+export class WhatsAppError extends Error {
+  constructor(code, message, status = 400) {
+    super(message);
+    this.code = code;
+    this.status = status;
+  }
+}
+
+const FALSY = new Set(['false', '0', 'no', 'off', 'nao', 'não']);
+
+/**
+ * Ligado por padrao SO no Render (que define RENDER=true): em qualquer outro
+ * lugar - o computador de quem desenvolve, onde o .env costuma apontar para o
+ * banco de producao - o padrao e desligado, para nunca disputar a conexao do
+ * WhatsApp com o servidor de verdade. WHATSAPP_ENABLED=true/false decide
+ * sempre, nos dois sentidos.
+ */
+function isEnabled(env) {
+  const explicit = String(env.WHATSAPP_ENABLED ?? '').trim().toLowerCase();
+  if (explicit) return !FALSY.has(explicit);
+  return Boolean(String(env.RENDER ?? '').trim());
+}
+
+export function readConfig(env = process.env) {
+  const number = digitsOf(env.WHATSAPP_NUMBER || '5491164610665');
+  return {
+    enabled: isEnabled(env),
+    // O numero da biblioteca: +54 9 11 6461-0665.
+    number,
+    // Teto de mensagens enviadas pelo painel nas ultimas 24 horas.
+    dailyLimit: Number(env.WHATSAPP_DAILY_LIMIT) > 0 ? Number(env.WHATSAPP_DAILY_LIMIT) : 300,
+    logLevel: env.WHATSAPP_LOG_LEVEL || 'warn',
+    retryBaseMs: 2000,
+    retryMaxMs: 60 * 1000,
+    standbyRetryMs: 10 * 1000,
+    heartbeatMs: 15 * 1000,
+    leaseTtlMs: 45 * 1000,
+    sendTimeoutMs: 25 * 1000,
+    // Envio sem resposta a tempo e AMBIGUO (a mensagem pode ter saido): a
+    // cobranca so e desfeita se, depois deste prazo, a mensagem nao aparecer.
+    ambiguousUndoMs: 90 * 1000,
+    // Quanto do historico (que o WhatsApp manda ao vincular) entra no painel.
+    historyDays: 90,
+    historyMax: 5000,
+    // De quanto em quanto tempo confere de novo se o numero tem WhatsApp.
+    recheckMs: 30 * 24 * 60 * 60 * 1000,
+  };
+}
+
+function withTimeout(promise, ms, code = 'TIMEOUT', message = 'O WhatsApp demorou demais para responder.') {
+  let timer;
+  const limit = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new WhatsAppError(code, message, 504)), ms);
+  });
+  return Promise.race([promise, limit]).finally(() => clearTimeout(timer));
+}
+
+// Tenta de novo, com espera, antes de desistir (falha passageira do banco).
+async function retrying(task, waits = [250, 1000, 3000]) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await task();
+    } catch (error) {
+      if (attempt >= waits.length) throw error;
+      await new Promise((resolve) => setTimeout(resolve, waits[attempt]));
+    }
+  }
+}
+
+function toMs(timestamp) {
+  const seconds =
+    typeof timestamp === 'number'
+      ? timestamp
+      : typeof timestamp?.toNumber === 'function'
+        ? timestamp.toNumber()
+        : Number(timestamp);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : Date.now();
+}
+
+function lastDigits(value) {
+  const digits = digitsOf(value);
+  return digits ? 'terminado em ' + digits.slice(-4) : 'desconhecido';
+}
+
+// O que o servidor faz por padrao: abrir o socket de verdade.
+function defaultSocketFactory(options) {
+  return makeWASocket({
+    ...options,
+    auth: {
+      creds: options.auth.creds,
+      keys: makeCacheableSignalKeyStore(options.auth.keys, options.logger),
+    },
+  });
+}
+
+export class WhatsAppService {
+  #cfg;
+  #socketFactory;
+  #authFactory;
+  #sessionExists;
+  #lease;
+  #logger;
+
+  #sock = null;
+  #gen = 0;
+  #auth = null;
+  #state = 'idle';
+  #since = Date.now();
+  #qr = null;
+  #notice = '';
+  #attempts = 0;
+  #connecting = false;
+  #started = false;
+  #closing = false;
+  #version;
+  #retryTimer = null;
+  #heartbeat = null;
+  #queue = Promise.resolve();
+  #historyQueue = Promise.resolve();
+
+  constructor(overrides = {}) {
+    this.#init(overrides);
+  }
+
+  #init(overrides) {
+    this.#cfg = { ...readConfig(), ...(overrides.config || {}) };
+    this.#socketFactory = overrides.socketFactory || defaultSocketFactory;
+    this.#authFactory = overrides.authFactory || (() => useMongoAuthState());
+    this.#sessionExists =
+      overrides.sessionExists || (async () => Boolean(await WaAuth.exists({ _id: 'creds' })));
+    this.#lease = overrides.lease || createLease({ ttlMs: this.#cfg.leaseTtlMs });
+    this.#logger =
+      overrides.logger || pino({ level: this.#cfg.logLevel }, pino.destination(2));
+    this.#version = overrides.version;
+    this.#state = this.#cfg.enabled ? 'idle' : 'disabled';
+  }
+
+  /** So para testes: troca as pecas (socket, trava, sessao) antes de iniciar. */
+  configure(overrides) {
+    if (this.#started || this.#sock) {
+      throw new Error('configure() só vale antes de iniciar.');
+    }
+    this.#init(overrides);
+  }
+
+  get config() {
+    return this.#cfg;
+  }
+
+  // ---------- Estado ----------
+
+  #setState(state, notice = '') {
+    if (state !== this.#state) {
+      console.log('WhatsApp: ' + state);
+    }
+    this.#state = state;
+    this.#notice = notice;
+    this.#since = Date.now();
+    if (state !== 'qr') this.#qr = null;
+  }
+
+  /** O que o painel pode saber. Nunca devolve credenciais. */
+  snapshot() {
+    return {
+      enabled: this.#cfg.enabled,
+      state: this.#state,
+      connected: this.#state === 'open',
+      qr: this.#state === 'qr' ? this.#qr : null,
+      hasSession: Boolean(this.#auth?.state?.creds?.me),
+      number: this.#cfg.number,
+      notice: this.#notice,
+      since: new Date(this.#since).toISOString(),
+    };
+  }
+
+  // ---------- Ligar e desligar ----------
+
+  /** Ao subir o servidor: se ja ha sessao salva, reconecta sozinho. */
+  async start() {
+    if (this.#started) return;
+    this.#started = true;
+    if (!this.#cfg.enabled) {
+      this.#setState('disabled', 'O WhatsApp está desligado neste servidor.');
+      return;
+    }
+    try {
+      if (await this.#sessionExists()) await this.connect({ auto: true });
+    } catch (error) {
+      console.error('WhatsApp: não foi possível iniciar:', error.message);
+    }
+  }
+
+  /** Abre a conexao (e o QR, se faltar a sessao). Pode ser chamado a vontade. */
+  async connect({ auto = false } = {}) {
+    if (!this.#cfg.enabled || this.#closing) return this.snapshot();
+    if (this.#connecting) return this.snapshot();
+    if (this.#sock && ['connecting', 'qr', 'open'].includes(this.#state)) {
+      return this.snapshot();
+    }
+    this.#connecting = true;
+    clearTimeout(this.#retryTimer);
+    try {
+      if (!(await this.#lease.acquire())) {
+        this.#setState(
+          'standby',
+          'Outra cópia do servidor está com a conexão do WhatsApp. Esta aguarda a vez.'
+        );
+        this.#scheduleRetry(this.#cfg.standbyRetryMs);
+        return this.snapshot();
+      }
+      this.#startHeartbeat();
+
+      // Reconectando, usa a sessao que ja esta na memoria (a do banco pode
+      // ainda nao ter recebido a ultima gravacao).
+      const auth = this.#auth?.state ? this.#auth : await this.#authFactory();
+      if (auth.status === 'unreadable') {
+        this.#auth = auth;
+        this.#stopHeartbeat();
+        await this.#lease.release().catch(() => {});
+        this.#setState(
+          'unreadable',
+          'A sessão salva não pôde ser lida (a chave de segurança mudou). Desconecte para apagá-la e leia o QR de novo.'
+        );
+        return this.snapshot();
+      }
+      this.#auth = auth;
+      await this.#open();
+    } catch (error) {
+      console.error('WhatsApp: falha ao conectar:', error.message);
+      this.#teardownSocket();
+      if (this.#auth?.state?.creds?.me) {
+        this.#setState('reconnecting', 'Não foi possível conectar agora. Tentando de novo.');
+        this.#scheduleRetry(this.#backoff());
+      } else {
+        this.#stopHeartbeat();
+        await this.#lease.release().catch(() => {});
+        this.#setState('idle', 'Não foi possível conectar agora. Tente de novo.');
+      }
+    } finally {
+      this.#connecting = false;
+    }
+    return this.snapshot();
+  }
+
+  async #open() {
+    const gen = ++this.#gen;
+    const auth = this.#auth;
+    let version = this.#version;
+    if (version === undefined) {
+      try {
+        const latest = await withTimeout(fetchLatestBaileysVersion(), 5000);
+        version = latest?.version || null;
+        this.#version = version;
+      } catch {
+        // Sem a versao nova desta vez: usa a embutida no Baileys, e tenta de
+        // novo na proxima conexao (nao guarda a falha).
+        version = null;
+      }
+    }
+    if (gen !== this.#gen) return;
+
+    const sock = this.#socketFactory({
+      auth: auth.state,
+      ...(version ? { version } : {}),
+      browser: ['Biblioteca ADMP', 'Chrome', '1.0.0'],
+      logger: this.#logger,
+      // O celular continua recebendo as notificacoes normais.
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: false,
+      // Para o WhatsApp reenviar uma mensagem que o destinatario nao conseguiu abrir.
+      getMessage: async (key) => {
+        const found = await WaMessage.findOne({ waId: key.id, fromMe: true }).lean();
+        return found?.text ? { conversation: found.text } : undefined;
+      },
+    });
+    this.#sock = sock;
+    this.#setState('connecting');
+
+    sock.ev.on('creds.update', () => {
+      auth.saveCreds().catch((error) => {
+        console.error('WhatsApp: não foi possível salvar a sessão:', error.message);
+      });
+    });
+    sock.ev.on('connection.update', (update) => {
+      this.#onConnectionUpdate(gen, sock, update).catch((error) => {
+        console.error('WhatsApp: erro na conexão:', error.message);
+      });
+    });
+    sock.ev.on('messages.upsert', (event) =>
+      this.#enqueue(gen, () => this.#onUpsert(sock, event))
+    );
+    sock.ev.on('messages.update', (updates) =>
+      this.#enqueue(gen, () => this.#onUpdates(sock, updates))
+    );
+    sock.ev.on('messaging-history.set', (event) =>
+      this.#enqueueHistory(gen, () => this.#onHistory(sock, event))
+    );
+  }
+
+  // O historico que o WhatsApp manda ao vincular pode ter milhares de mensagens:
+  // fica numa fila SEPARADA, para nao segurar as mensagens que chegam ao vivo.
+  // (Tudo que se grava e idempotente, entao as duas filas nao se atrapalham.)
+  #enqueueHistory(gen, task) {
+    this.#historyQueue = this.#historyQueue.then(async () => {
+      if (gen !== this.#gen) return;
+      try {
+        await task();
+      } catch (error) {
+        console.error('WhatsApp: erro ao guardar o histórico:', error.message);
+      }
+    });
+    return this.#historyQueue;
+  }
+
+  #enqueue(gen, task) {
+    this.#queue = this.#queue.then(async () => {
+      if (gen !== this.#gen) return;
+      try {
+        await task();
+      } catch (error) {
+        console.error('WhatsApp: erro ao guardar mensagem:', error.message);
+      }
+    });
+    return this.#queue;
+  }
+
+  async #onConnectionUpdate(gen, sock, update) {
+    if (gen !== this.#gen) return;
+    const { connection, qr, lastDisconnect } = update;
+
+    if (qr) {
+      this.#qr = qr;
+      if (this.#state !== 'open') this.#setState('qr');
+    }
+    if (connection === 'connecting' && this.#state !== 'qr') {
+      this.#setState('connecting');
+    }
+    if (connection === 'open') await this.#onOpen(gen, sock);
+    if (connection === 'close') await this.#onClose(gen, lastDisconnect?.error);
+  }
+
+  async #onOpen(gen, sock) {
+    const me = sock.user?.id || this.#auth?.state?.creds?.me?.id || '';
+    const meDigits = phoneFromJid(me);
+    if (!meDigits) {
+      // Sem como conferir o numero: NAO desvincula (poderia ser a conta certa).
+      this.#stopHeartbeat();
+      this.#teardownSocket();
+      await this.#lease.release().catch(() => {});
+      this.#setState(
+        'error',
+        'Não foi possível confirmar qual número está conectado. Tente conectar de novo.'
+      );
+      return;
+    }
+    if (!samePhone(meDigits, this.#cfg.number)) {
+      await this.#rejectWrongNumber(gen, sock, meDigits);
+      return;
+    }
+    this.#attempts = 0;
+    this.#setState('open');
+  }
+
+  /** Alguem leu o QR com outro numero: desvincula e apaga a sessao. */
+  async #rejectWrongNumber(gen, sock, meDigits) {
+    console.warn('WhatsApp: número diferente do da biblioteca (' + lastDigits(meDigits) + '). Desvinculando.');
+    this.#gen += 1; // ignora o que ainda chegar deste socket
+    this.#sock = null;
+    try {
+      await withTimeout(sock.logout('número incorreto'), 8000);
+    } catch {
+      try {
+        sock.end(undefined);
+      } catch {
+        /* ja fechado */
+      }
+    }
+    await this.#auth?.clear().catch(() => {});
+    this.#auth = null;
+    this.#stopHeartbeat();
+    await this.#lease.release().catch(() => {});
+    this.#setState(
+      'wrong-number',
+      'Esse WhatsApp (' +
+        lastDigits(meDigits) +
+        ') não é o da biblioteca. Foi desvinculado. Leia o QR code com o celular do número +' +
+        this.#cfg.number +
+        '.'
+    );
+  }
+
+  async #onClose(gen, error) {
+    if (gen !== this.#gen) return;
+    this.#sock = null;
+    const code = error?.output?.statusCode;
+    const registered = Boolean(this.#auth?.state?.creds?.me);
+
+    // Terminou o pareamento: o WhatsApp pede para abrir de novo com a sessao nova.
+    if (code === DisconnectReason.restartRequired) {
+      try {
+        await this.#open();
+      } catch (openError) {
+        console.error('WhatsApp: falha ao reabrir:', openError.message);
+        this.#setState('reconnecting', 'Reconectando…');
+        this.#scheduleRetry(this.#backoff());
+      }
+      return;
+    }
+
+    // 500 pode ser uma falha passageira do WhatsApp: tenta de novo algumas
+    // vezes antes de desistir (e mesmo assim NAO apaga a sessao sozinho).
+    if (code === DisconnectReason.badSession) {
+      if (this.#attempts >= 5) {
+        this.#stopHeartbeat();
+        await this.#lease.release().catch(() => {});
+        this.#setState(
+          'error',
+          'O WhatsApp recusou a sessão salva. Desconecte e leia o QR code de novo.'
+        );
+      } else {
+        this.#setState('reconnecting', 'A conexão caiu. Reconectando…');
+        this.#scheduleRetry(this.#backoff());
+      }
+      return;
+    }
+
+    if (
+      code === DisconnectReason.loggedOut ||
+      code === DisconnectReason.multideviceMismatch
+    ) {
+      await this.#endSession(
+        'logged-out',
+        'O celular desconectou este aparelho do WhatsApp. Leia o QR code de novo para voltar.'
+      );
+      return;
+    }
+
+    if (code === DisconnectReason.forbidden) {
+      this.#stopHeartbeat();
+      await this.#lease.release().catch(() => {});
+      this.#setState(
+        'error',
+        'O WhatsApp recusou a conexão. A conta pode estar restrita; confira o aplicativo no celular.'
+      );
+      return;
+    }
+
+    if (!registered) {
+      // O QR venceu sem ninguem ler: nao fica gerando QR sem parar.
+      this.#stopHeartbeat();
+      await this.#lease.release().catch(() => {});
+      this.#setState('idle', 'O QR code expirou. Toque em “Gerar o QR code” para ver outro.');
+      return;
+    }
+
+    if (code === DisconnectReason.connectionReplaced) {
+      this.#setState(
+        'reconnecting',
+        'Outra conexão assumiu a sessão do WhatsApp. Vou tentar de novo em instantes.'
+      );
+      this.#scheduleRetry(Math.max(this.#backoff(), 30 * 1000));
+      return;
+    }
+
+    this.#setState('reconnecting', 'A conexão caiu. Reconectando…');
+    this.#scheduleRetry(this.#backoff());
+  }
+
+  async #endSession(state, notice) {
+    this.#teardownSocket();
+    await this.#auth?.clear().catch(() => {});
+    this.#auth = null;
+    this.#stopHeartbeat();
+    await this.#lease.release().catch(() => {});
+    this.#setState(state, notice);
+  }
+
+  #backoff() {
+    const base = Math.min(
+      this.#cfg.retryMaxMs,
+      this.#cfg.retryBaseMs * 2 ** Math.min(this.#attempts, 10)
+    );
+    this.#attempts += 1;
+    return Math.round(base * (0.75 + Math.random() * 0.5));
+  }
+
+  #scheduleRetry(ms) {
+    clearTimeout(this.#retryTimer);
+    if (this.#closing) return;
+    this.#retryTimer = setTimeout(() => {
+      this.connect({ auto: true }).catch(() => {});
+    }, ms);
+    this.#retryTimer.unref?.();
+  }
+
+  #teardownSocket() {
+    this.#gen += 1;
+    const sock = this.#sock;
+    this.#sock = null;
+    this.#qr = null;
+    if (sock) {
+      try {
+        sock.end(undefined);
+      } catch {
+        /* ja fechado */
+      }
+    }
+  }
+
+  #startHeartbeat() {
+    if (this.#heartbeat) return;
+    this.#heartbeat = setInterval(async () => {
+      try {
+        if (!(await this.#lease.renew())) this.#loseLease();
+      } catch (error) {
+        console.error('WhatsApp: não foi possível renovar a trava:', error.message);
+      }
+    }, this.#cfg.heartbeatMs);
+    this.#heartbeat.unref?.();
+  }
+
+  #stopHeartbeat() {
+    clearInterval(this.#heartbeat);
+    this.#heartbeat = null;
+  }
+
+  // Outra copia do servidor tomou a trava: solta a conexao SEM desvincular.
+  #loseLease() {
+    this.#stopHeartbeat();
+    this.#teardownSocket();
+    this.#auth = null; // outra copia pode ter gravado: recarrega do banco depois
+    this.#setState(
+      'standby',
+      'Outra cópia do servidor assumiu a conexão do WhatsApp. Esta aguarda a vez.'
+    );
+    this.#scheduleRetry(this.#cfg.standbyRetryMs);
+  }
+
+  /**
+   * Desligamento com calma (o Render manda SIGTERM a cada deploy): fecha a
+   * conexao SEM desvincular e solta a trava para a copia nova assumir logo.
+   */
+  async shutdown() {
+    this.#closing = true;
+    clearTimeout(this.#retryTimer);
+    this.#stopHeartbeat();
+    this.#teardownSocket();
+    await this.#queue.catch(() => {});
+    // Termina de gravar as chaves da sessao antes de soltar a trava: uma
+    // gravacao perdida estragaria a criptografia na proxima conexao.
+    await this.#auth?.flush?.().catch?.(() => {});
+    if (this.#cfg.enabled) await this.#lease.release().catch(() => {});
+  }
+
+  /** Pedido do administrador: desvincula o aparelho e apaga a sessao. */
+  async disconnect() {
+    if (!this.#cfg.enabled) {
+      throw new WhatsAppError('DISABLED', 'O WhatsApp está desligado neste servidor.', 409);
+    }
+    if (!(await this.#lease.acquire())) {
+      throw new WhatsAppError(
+        'STANDBY',
+        'Outra cópia do servidor está com a conexão do WhatsApp. Tente de novo em instantes.',
+        409
+      );
+    }
+    clearTimeout(this.#retryTimer);
+    const sock = this.#sock;
+    this.#gen += 1; // ignora o fechamento que vem a seguir
+    this.#sock = null;
+    this.#qr = null;
+    if (sock) {
+      try {
+        await withTimeout(sock.logout('desconectado pelo painel'), 8000);
+      } catch {
+        try {
+          sock.end(undefined);
+        } catch {
+          /* ja fechado */
+        }
+      }
+    }
+    const auth = this.#auth || (await this.#authFactory());
+    await auth.clear();
+    this.#auth = null;
+    this.#attempts = 0;
+    this.#stopHeartbeat();
+    await this.#lease.release().catch(() => {});
+    this.#setState('idle', 'O WhatsApp foi desconectado. Leia o QR code para conectar de novo.');
+    return this.snapshot();
+  }
+
+  /** Codigo de 8 letras para digitar no WhatsApp, no lugar de ler o QR. */
+  async requestPairingCode() {
+    const sock = this.#sock;
+    if (!sock || this.#state !== 'qr') {
+      throw new WhatsAppError(
+        'NOT_READY',
+        'A conexão ainda não está pronta para gerar o código. Aguarde o QR code aparecer e tente de novo.',
+        409
+      );
+    }
+    if (sock.authState?.creds?.registered) {
+      throw new WhatsAppError('ALREADY', 'Este aparelho já está vinculado.', 409);
+    }
+    // Sempre o numero da biblioteca: o painel nao escolhe numero nenhum.
+    return withTimeout(sock.requestPairingCode(this.#cfg.number), 20 * 1000);
+  }
+
+  // ---------- Receber ----------
+
+  async #identity(sock, key) {
+    const remote = key.remoteJid;
+    const alt = key.remoteJidAlt;
+    let phone = phoneFromJid(remote) || phoneFromJid(alt);
+    const lid = lidFromJid(remote) || lidFromJid(alt);
+    if (!phone && lid) {
+      try {
+        const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(lid);
+        phone = phoneFromJid(pn);
+      } catch {
+        /* sem o numero: a conversa fica so com o LID */
+      }
+    }
+    if (!phone && !lid) return null;
+    return { phone, lid };
+  }
+
+  async #onUpsert(sock, { messages }) {
+    for (const message of messages || []) {
+      try {
+        // O WhatsApp ja deu o "recebido": se o banco falhar neste instante,
+        // tenta de novo algumas vezes antes de desistir (senao a mensagem some).
+        await retrying(() => this.#ingest(sock, message, { history: false }));
+      } catch (error) {
+        console.error('WhatsApp: mensagem ignorada:', error.message);
+      }
+    }
+  }
+
+  async #onHistory(sock, { messages }) {
+    const oldest = Date.now() - this.#cfg.historyDays * 24 * 60 * 60 * 1000;
+    let count = 0;
+    for (const message of messages || []) {
+      if (count >= this.#cfg.historyMax) break;
+      if (toMs(message.messageTimestamp) < oldest) continue;
+      count += 1;
+      try {
+        await this.#ingest(sock, message, { history: true });
+      } catch (error) {
+        console.error('WhatsApp: mensagem do histórico ignorada:', error.message);
+      }
+    }
+  }
+
+  async #ingest(sock, message, { history }) {
+    const key = message?.key;
+    if (!key?.id || !key.remoteJid) return;
+    // So conversas com uma pessoa: grupos, status e canais ficam de fora.
+    if (!isPnUser(key.remoteJid) && !isLidUser(key.remoteJid)) return;
+
+    const identity = await this.#identity(sock, key);
+    if (!identity) return;
+    // A conversa do numero com ele mesmo ("mensagens para mim").
+    if (identity.phone && samePhone(identity.phone, this.#cfg.number)) return;
+
+    const info = describeMessage(message);
+    if (info.revokeId || info.edit) {
+      const chat = await resolveChat({ ...identity, create: false });
+      if (!chat) return;
+      if (info.revokeId) await markDeleted(chat._id, info.revokeId);
+      else await markEdited(chat._id, info.edit.id, info.edit.text);
+      return;
+    }
+    if (info.skip) return;
+
+    const fromMe = Boolean(key.fromMe);
+    const chat = await resolveChat({
+      ...identity,
+      pushName: fromMe ? '' : String(message.pushName || '').slice(0, 80),
+      authoritative: true,
+    });
+    if (!chat) return;
+    await saveMessage(chat, {
+      waId: key.id,
+      fromMe,
+      kind: info.kind,
+      text: info.text,
+      at: toMs(message.messageTimestamp),
+      status: fromMe ? Number(message.status) || 2 : 2,
+      // Mensagem recebida enquanto o servidor dormia chega como "append": conta
+      // do mesmo jeito. O historico do vinculo nao conta.
+      countUnread: !history && !fromMe,
+    });
+  }
+
+  async #onUpdates(sock, updates) {
+    for (const { key, update } of updates || []) {
+      try {
+        if (!key?.id || !key.remoteJid) continue;
+        if (!isPnUser(key.remoteJid) && !isLidUser(key.remoteJid)) continue;
+        const identity = await this.#identity(sock, key);
+        if (!identity) continue;
+        const chat = await resolveChat({ ...identity, create: false });
+        if (!chat) continue;
+
+        if (update?.messageStubType === proto.WebMessageInfo.StubType.REVOKE) {
+          await markDeleted(chat._id, key.id);
+        } else if (update?.message?.editedMessage?.message) {
+          const edited = describeMessage({ message: update.message.editedMessage.message });
+          if (!edited.skip) await markEdited(chat._id, key.id, edited.text || '');
+        } else if (typeof update?.status === 'number' && key.fromMe) {
+          await raiseStatus(chat._id, key.id, update.status);
+        }
+      } catch (error) {
+        console.error('WhatsApp: atualização ignorada:', error.message);
+      }
+    }
+  }
+
+  // ---------- Enviar ----------
+
+  #requireOpen() {
+    if (this.#state === 'open' && this.#sock) return this.#sock;
+    throw new WhatsAppError(
+      'WA_OFFLINE',
+      'O WhatsApp da biblioteca não está conectado agora.',
+      503
+    );
+  }
+
+  async #targetJid(sock, chat) {
+    const recent =
+      chat.checkedAt && Date.now() - new Date(chat.checkedAt).getTime() < this.#cfg.recheckMs;
+    if (chat.jid && recent) return chat.jid;
+
+    if (chat.phone) {
+      let found;
+      try {
+        found = await withTimeout(sock.onWhatsApp(chat.phone), 15 * 1000);
+      } catch (error) {
+        if (error instanceof WhatsAppError) throw error;
+        throw new WhatsAppError('LOOKUP_FAILED', 'Não deu para conferir o número no WhatsApp agora.', 502);
+      }
+      const hit = Array.isArray(found) ? found.find((item) => item?.exists) : null;
+      if (!hit?.jid) {
+        // Ja falou com ele por LID? Ainda da para responder.
+        if (chat.lid) return chat.lid;
+        throw new WhatsAppError('NOT_ON_WHATSAPP', 'Esse número não tem WhatsApp.', 422);
+      }
+      await WaChat.updateOne(
+        { _id: chat._id },
+        { $set: { jid: hit.jid, phone: phoneFromJid(hit.jid) || chat.phone, checkedAt: new Date() } }
+      );
+      return hit.jid;
+    }
+    if (chat.lid) return chat.lid;
+    throw new WhatsAppError('NO_ADDRESS', 'Essa conversa não tem número para enviar.', 422);
+  }
+
+  /** Quantas mensagens o painel enviou nas ultimas 24 horas. */
+  async sentToday() {
+    return WaMessage.countDocuments({
+      fromMe: true,
+      sentBy: { $ne: null },
+      at: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
+    });
+  }
+
+  /** Confere (sem enviar) se da para enviar agora; lanca o erro se nao. */
+  async assertCanSend() {
+    this.#requireOpen();
+    if ((await this.sentToday()) >= this.#cfg.dailyLimit) {
+      throw new WhatsAppError(
+        'DAILY_LIMIT',
+        'O limite de mensagens enviadas pelo painel nas últimas 24 horas foi atingido. Isso protege o número da biblioteca de ser bloqueado pelo WhatsApp.',
+        429
+      );
+    }
+  }
+
+  /** Envia o texto e devolve o id da mensagem no WhatsApp. */
+  async sendText(chat, text) {
+    await this.assertCanSend();
+    const sock = this.#requireOpen();
+    const jid = await this.#targetJid(sock, chat);
+    let sent;
+    try {
+      sent = await withTimeout(
+        sock.sendMessage(jid, { text }),
+        this.#cfg.sendTimeoutMs,
+        'SEND_TIMEOUT',
+        'O WhatsApp não confirmou o envio a tempo. Confira na conversa se a mensagem saiu.'
+      );
+    } catch (error) {
+      if (error instanceof WhatsAppError) throw error;
+      throw new WhatsAppError(
+        'SEND_FAILED',
+        'Não foi possível enviar a mensagem pelo WhatsApp agora.',
+        502
+      );
+    }
+    if (!sent?.key?.id) {
+      throw new WhatsAppError('SEND_FAILED', 'O WhatsApp não confirmou o envio.', 502);
+    }
+    return { waId: sent.key.id, at: toMs(sent.messageTimestamp), jid };
+  }
+
+  /** Avisa o WhatsApp que as mensagens foram lidas (como o WhatsApp Web faz). */
+  async sendReadReceipts(chat, waIds) {
+    if (this.#state !== 'open' || !this.#sock || !chat.jid || !waIds.length) return;
+    try {
+      await this.#sock.readMessages(
+        waIds.map((id) => ({ remoteJid: chat.jid, id, fromMe: false }))
+      );
+    } catch {
+      /* so um aviso a pessoa: a leitura no painel ja valeu */
+    }
+  }
+}
+
+/** A copia que o servidor usa. */
+export const whatsapp = new WhatsAppService();

@@ -16,6 +16,8 @@ import photoRoutes from "./src/routes/photos.js";
 import devRoutes from "./src/routes/dev.js";
 import notificationRoutes from "./src/routes/notifications.js";
 import captchaRoutes from "./src/routes/captcha.js";
+import whatsappRoutes from "./src/routes/whatsapp.js";
+import { whatsapp } from "./src/services/whatsapp/service.js";
 import requestRoutes, {
   ogPreviewHandler,
   publicRequests,
@@ -201,6 +203,9 @@ app.use("/api/photo", requireAdmin, express.json({ limit: "6mb" }));
 // entao precisa do mesmo limite - e, do mesmo jeito, so depois de conferir
 // que quem esta chamando e a sessao de manutencao.
 app.use("/api/dev", requireDev, express.json({ limit: "6mb" }));
+// Conversas do WhatsApp: so texto (ate 4096 letras), entao o corpo aceito e
+// pequeno - e, como nas outras, so depois de conferir o login.
+app.use("/api/whatsapp", requireAdmin, express.json({ limit: "32kb" }));
 // "Avise-me quando voltar" do acervo publico: rota SEM login, entao o corpo
 // aceito e minusculo (a inscricao de notificacao tem menos de 1 KB).
 app.use("/api/public/alerts", express.json({ limit: "8kb" }), publicBodyErrors);
@@ -256,6 +261,8 @@ app.use("/api/public/requests", publicRequests);
 app.use("/api/suggestions", suggestionRoutes);
 // Sininho do painel: solicitacoes e sugestoes novas (so administrador).
 app.use("/api/notifications", notificationRoutes);
+// Conversas com as pessoas pelo WhatsApp da biblioteca (so administrador).
+app.use("/api/whatsapp", whatsappRoutes);
 app.use("/api/public", publicRoutes);
 
 // Rota nao encontrada
@@ -403,13 +410,42 @@ async function prepareDatabase() {
   }
 }
 
+// Desligar com calma (o Render manda SIGTERM a cada deploy): fecha o WhatsApp
+// SEM desvincular e solta a trava, para a copia nova assumir sem esperar.
+let shuttingDown = false;
+let httpServer = null;
+function shutDown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(signal + ": encerrando…");
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // 1) Para de aceitar pedidos novos e espera os que estao em andamento (um
+  //    envio no meio, por exemplo, termina de gravar antes de tudo fechar);
+  // 2) so entao fecha o WhatsApp. Cada passo tem prazo: o Render da ~30 s.
+  const drained = new Promise((resolve) => {
+    if (!httpServer) return resolve();
+    httpServer.close(() => resolve());
+    httpServer.closeIdleConnections?.();
+    return undefined;
+  });
+  Promise.race([drained, wait(8000)])
+    .then(() => Promise.race([whatsapp.shutdown(), wait(5000)]))
+    .catch(() => {})
+    .finally(() => process.exit(0));
+}
+process.on("SIGTERM", () => shutDown("SIGTERM"));
+process.on("SIGINT", () => shutDown("SIGINT"));
+
 connectDatabase()
   .then(async () => {
     warnAboutDevLogin();
     warnAboutCaptcha();
     await prepareDatabase();
-    app.listen(PORT, () => {
+    httpServer = app.listen(PORT, () => {
       console.log("API rodando na porta " + PORT);
+      // Reconecta o WhatsApp da biblioteca se ja houver sessao salva. Roda em
+      // segundo plano: nao segura a subida do servidor.
+      whatsapp.start();
     });
   })
   .catch((error) => {

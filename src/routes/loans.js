@@ -14,6 +14,8 @@ import {
 } from "../services/loans.js";
 import { announceAvailability } from "../services/returnAlerts.js";
 import { allWordsRegex, escapeRegex } from "../services/search.js";
+import { registerCharge } from "../services/charges.js";
+import { addDays, brDate, dayOf, todayInBrazil } from "../services/brDates.js";
 
 const router = Router();
 router.use(requireAdmin);
@@ -126,148 +128,24 @@ router.post("/", async (req, res, next) => {
   }
 });
 
-// ---------- Datas (dia de Brasilia) ----------
+// ---------- Datas (dia de Brasilia: ver services/brDates.js) ----------
 
-// Cobranca de atraso pelo WhatsApp: no maximo uma a cada 30 dias por
-// emprestimo, seja qual for o administrador.
-const CHARGE_INTERVAL_DAYS = 30;
 // Prazo estendido: no maximo um ano a frente de hoje (barra data digitada
 // errada, como 2062 no lugar de 2026).
 const MAX_EXTENSION_DAYS = 365;
 
-function todayInBrazil() {
-  return new Date().toLocaleDateString("en-CA", {
-    timeZone: "America/Sao_Paulo",
-  });
-}
-
-// O dia ("AAAA-MM-DD") de uma data salva, do mesmo jeito que o app mostra
-// (utils/dates.js no front): meia-noite UTC e "so a data" (e assim que as
-// datas dos campos chegam aqui); o resto vale pelo dia de Brasilia.
-function dayOf(date) {
-  if (!date) return "";
-  const value = new Date(date);
-  if (
-    value.getUTCHours() === 0 &&
-    value.getUTCMinutes() === 0 &&
-    value.getUTCSeconds() === 0 &&
-    value.getUTCMilliseconds() === 0
-  ) {
-    return value.toISOString().slice(0, 10);
-  }
-  return value.toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" });
-}
-
-// O dia de Brasilia de um MOMENTO (ex.: quando cobrou).
-function brazilDay(date) {
-  return new Date(date).toLocaleDateString("en-CA", {
-    timeZone: "America/Sao_Paulo",
-  });
-}
-
-// O dia em que a proxima cobranca fica liberada.
-function nextChargeDay(sentAt) {
-  return addDays(brazilDay(sentAt), CHARGE_INTERVAL_DAYS);
-}
-
-function addDays(day, days) {
-  const date = new Date(day + "T00:00:00Z");
-  date.setUTCDate(date.getUTCDate() + days);
-  return date.toISOString().slice(0, 10);
-}
-
-function brDate(day) {
-  const [year, month, date] = day.split("-");
-  return date + "/" + month + "/" + year;
-}
-
-// Atrasado = em andamento e o dia combinado ja passou (o proprio dia ainda
-// esta no prazo), igual a barra dos cards.
-function isOverdue(loan) {
-  return (
-    loan.status === "ativo" &&
-    Boolean(loan.dueDate) &&
-    todayInBrazil() > dayOf(loan.dueDate)
-  );
-}
-
 // PATCH /api/loans/:id/notified
 // Registra a COBRANCA do atraso pelo WhatsApp, em nome do administrador da
-// sessao. O app registra ANTES de abrir o WhatsApp: com a regra de uma a cada
-// 30 dias, quem decide se a cobranca pode sair e o servidor (dois
+// sessao. O app registra ANTES de abrir o WhatsApp do celular: com a regra de
+// uma a cada 30 dias, quem decide se a cobranca pode sair e o servidor (dois
 // administradores com a tela aberta nao cobram a mesma pessoa duas vezes).
+// A regra mora em services/charges.js; o envio de dentro do painel
+// (routes/whatsapp.js) usa a mesma.
 router.patch("/:id/notified", async (req, res, next) => {
   try {
-    const loan = await Loan.findById(req.params.id);
-    if (!loan)
-      return res.status(404).json({ error: "Empréstimo não encontrado." });
-    const current = async () => withAdminFlag(loan.toObject());
-    if (loan.status !== "ativo") {
-      return res.status(409).json({
-        error: "Esse empréstimo já foi devolvido.",
-        loan: await current(),
-      });
-    }
-    if (!loan.personPhone) {
-      return res.status(409).json({
-        error: "Esse empréstimo não tem WhatsApp cadastrado.",
-        loan: await current(),
-      });
-    }
-    if (!isOverdue(loan)) {
-      return res.status(409).json({
-        error: "O prazo desse empréstimo ainda não venceu: a cobrança só vale para livro atrasado.",
-        loan: await current(),
-      });
-    }
-
-    // A conta e por DIA de Brasilia: cobrado no dia 7, libera no dia 7 do mes
-    // seguinte (30 dias depois), a qualquer hora. Vale quem cobrou antes do
-    // inicio (03:00 UTC) do dia "hoje - 29".
-    const limit = new Date(
-      addDays(todayInBrazil(), -(CHARGE_INTERVAL_DAYS - 1)) + "T03:00:00Z",
-    );
-    // Confere e grava de uma vez so: entre ler e gravar, outro administrador
-    // pode ter cobrado, estendido o prazo ou confirmado a devolucao.
-    const updated = await Loan.findOneAndUpdate(
-      {
-        _id: loan._id,
-        status: "ativo",
-        dueDate: loan.dueDate,
-        $or: [{ overdueSentAt: null }, { overdueSentAt: { $lt: limit } }],
-      },
-      {
-        overdueSentAt: new Date(),
-        overdueSentBy: req.account._id,
-        overdueSentByName: req.account.fullName,
-      },
-      { new: true },
-    );
-    if (!updated) {
-      const fresh = await Loan.findById(loan._id);
-      if (!fresh) {
-        return res.status(404).json({ error: "Empréstimo não encontrado." });
-      }
-      const freshLoan = await withAdminFlag(fresh.toObject());
-      let error =
-        "Esse empréstimo acabou de mudar. Confira os detalhes e tente de novo.";
-      if (fresh.status !== "ativo") {
-        error = "Esse empréstimo acabou de ser devolvido.";
-      } else if (!isOverdue(fresh)) {
-        error =
-          "O prazo desse empréstimo acabou de ser estendido: ele não está mais atrasado.";
-      } else if (fresh.overdueSentAt && fresh.overdueSentAt >= limit) {
-        error =
-          (fresh.overdueSentByName || "Alguém") +
-          " já cobrou essa pessoa em " +
-          brDate(brazilDay(fresh.overdueSentAt)) +
-          ". A próxima cobrança fica liberada em " +
-          brDate(nextChargeDay(fresh.overdueSentAt)) +
-          ".";
-      }
-      return res.status(409).json({ error, loan: freshLoan });
-    }
-    return res.json(await withAdminFlag(updated.toObject()));
+    const result = await registerCharge(req.params.id, req.account);
+    if (!result.ok) return res.status(result.status).json(result.body);
+    return res.json(result.loan);
   } catch (error) {
     return next(error);
   }
