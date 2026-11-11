@@ -30,6 +30,7 @@ import {
 import { announceAvailability } from "../services/returnAlerts.js";
 import { preparePreview, previewFor } from "../services/requestPreview.js";
 import { networkOf } from "./suggestions.js";
+import { requestChannel } from "../services/whatsapp/bot.js";
 
 /**
  * SOLICITACOES DE EMPRESTIMO (ver models/LoanRequest.js).
@@ -459,16 +460,23 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
           requesterName: name,
           requesterPerson: chosen ? chosen._id : null,
           requesterIsNew,
+          // Mudou o dia: a nova mensagem avisa o administrador de novo.
+          waNotifiedAt: null,
         },
       },
       { new: true },
     );
+    // Para qual WhatsApp a tela manda a mensagem (o do robo ou, de reserva,
+    // o brasileiro: ver requestChannel em services/whatsapp/bot.js).
+    const channel = requestChannel();
     if (again) {
       preparePreview(book._id);
       return res.json({
         token: again.token,
         pickupDate: day.text,
         name: shownName,
+        whatsapp: channel.number,
+        via: channel.via,
       });
     }
 
@@ -502,7 +510,13 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
 
     return res
       .status(201)
-      .json({ token: request.token, pickupDate: day.text, name: shownName });
+      .json({
+        token: request.token,
+        pickupDate: day.text,
+        name: shownName,
+        whatsapp: channel.number,
+        via: channel.via,
+      });
   } catch (error) {
     return next(error);
   }
@@ -712,6 +726,9 @@ router.get("/link/:token", async (req, res, next) => {
       requesterPerson: await personCard(request.requesterPerson),
       requesterIsNew: Boolean(request.requesterIsNew),
       pickupDate: request.pickupDate,
+      // O WhatsApp de onde o pedido chegou ao robo da biblioteca (vazio se a
+      // mensagem foi para o numero brasileiro): a tela confere com a ficha.
+      whatsappFrom: request.waPhone || "",
       book: await withSituation(book),
     });
   } catch (error) {

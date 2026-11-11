@@ -64,7 +64,7 @@ export function overdueText(loan) {
     '* venceu em ' +
     brDate(dayOf(loan.dueDate)) +
     '. Pedimos que faça a devolução o quanto antes.\n\n' +
-    '*1* – Falar com um administrador\n*0* – Ver o menu de atendimento'
+    '1️⃣ Falar com um administrador\n0️⃣ Ver o menu de atendimento'
   );
 }
 

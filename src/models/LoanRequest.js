@@ -71,6 +71,13 @@ const loanRequestSchema = new mongoose.Schema(
     registeredByName: { type: String, default: '' },
     registeredAt: { type: Date, default: null },
 
+    // WHATSAPP DA BIBLIOTECA (services/whatsapp/bot.js): a conversa e o numero
+    // de onde a mensagem com o link chegou, e quando o administrador foi
+    // avisado (uma vez por link; o mesmo link de novo nao avisa outra vez).
+    waChat: { type: mongoose.Schema.Types.ObjectId, ref: 'WaChat', default: null },
+    waPhone: { type: String, default: '' },
+    waNotifiedAt: { type: Date, default: null },
+
     // Marca do "convertendo" (ver recoverStuckConversions em routes/requests.js).
     convertingAt: { type: Date, default: null },
 

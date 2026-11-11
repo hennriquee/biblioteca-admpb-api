@@ -173,6 +173,9 @@ export class WhatsAppService {
   #auth = null;
   #state = 'idle';
   #since = Date.now();
+  // Desde quando a conexao NAO esta aberta (null = aberta agora). Conta desde
+  // a subida do servidor; nao reinicia a cada nova tentativa de reconectar.
+  #downSince = Date.now();
   #qr = null;
   #notice = '';
   #attempts = 0;
@@ -227,6 +230,8 @@ export class WhatsAppService {
     if (state !== this.#state) {
       console.log('WhatsApp: ' + state);
     }
+    if (state === 'open') this.#downSince = null;
+    else if (this.#downSince === null) this.#downSince = Date.now();
     this.#state = state;
     this.#notice = notice;
     this.#since = Date.now();
@@ -246,6 +251,7 @@ export class WhatsAppService {
       number: this.#cfg.number,
       notice: this.#notice,
       since: new Date(this.#since).toISOString(),
+      downSince: this.#downSince === null ? null : new Date(this.#downSince).toISOString(),
     };
   }
 
@@ -1008,6 +1014,39 @@ export class WhatsAppService {
       throw new WhatsAppError('SEND_FAILED', 'O WhatsApp não confirmou o envio.', 502);
     }
     return { waId: sent.key.id, at: toMs(sent.messageTimestamp), jid };
+  }
+
+  /**
+   * Mostra (ou tira) o "digitando…" na conversa. E so um sinal: se falhar,
+   * nada muda (devolve false). Normalmente NAO deixa o numero "online" (o
+   * celular continua recebendo as notificacoes normais, como em
+   * markOnlineOnConnect: false). online: true (WHATSAPP_BOT_TYPING=online,
+   * reserva caso o WhatsApp so mostre o "digitando…" de quem esta online):
+   * fica "online" so durante a resposta e volta a "offline" ao tirar o sinal.
+   */
+  async setTyping(chat, typing, { online = false } = {}) {
+    const sock = this.#sock;
+    if (this.#state !== 'open' || !sock || typeof sock.sendPresenceUpdate !== 'function') {
+      return false;
+    }
+    const jid = chat?.jid || chat?.lid || '';
+    if (!jid) return false;
+    try {
+      if (typing && online) await withTimeout(sock.sendPresenceUpdate('available'), 5000);
+      await withTimeout(sock.sendPresenceUpdate(typing ? 'composing' : 'paused', jid), 5000);
+      return true;
+    } catch {
+      // Ficou "online" e o "digitando…" falhou: o robo nao vai tirar o sinal
+      // (setTyping devolveu false), entao volta a "offline" aqui mesmo.
+      if (typing && online) {
+        await withTimeout(sock.sendPresenceUpdate('unavailable'), 5000).catch(() => {});
+      }
+      return false;
+    } finally {
+      if (!typing && online) {
+        await withTimeout(sock.sendPresenceUpdate('unavailable'), 5000).catch(() => {});
+      }
+    }
   }
 
   /** Avisa o WhatsApp que as mensagens foram lidas (como o WhatsApp Web faz). */

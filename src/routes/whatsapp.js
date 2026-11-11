@@ -2,6 +2,7 @@ import { Router } from 'express';
 import mongoose from 'mongoose';
 import rateLimit from 'express-rate-limit';
 import Loan from '../models/Loan.js';
+import LoanRequest from '../models/LoanRequest.js';
 import Person from '../models/Person.js';
 import WaChat from '../models/WaChat.js';
 import WaMessage from '../models/WaMessage.js';
@@ -9,9 +10,10 @@ import { requireAdmin } from '../middleware/auth.js';
 import { normalizeText } from '../models/Book.js';
 import { allWordsRegex, escapeRegex } from '../services/search.js';
 import { registerCharge, undoCharge } from '../services/charges.js';
+import { shortName } from '../services/people.js';
 import { WhatsAppError, whatsapp } from '../services/whatsapp/service.js';
-import { bot } from '../services/whatsapp/bot.js';
-import { resolveChat, saveMessage } from '../services/whatsapp/store.js';
+import { bot, REQUEST_LINK } from '../services/whatsapp/bot.js';
+import { refreshLastMessage, resolveChat, saveMessage } from '../services/whatsapp/store.js';
 import {
   canonicalPhone,
   digitsOf,
@@ -115,6 +117,38 @@ function messageDto(message) {
   };
 }
 
+// Mensagem com o link de uma solicitacao do acervo publico (/solicitacao/<id>):
+// leva junto em que pe ela esta, para a conversa mostrar o botao "Aprovar".
+// request = { token, state: "pending" | "registered" | "gone", bookTitle,
+// personName }. (O link ja esta no texto da mensagem; o painel e so de
+// administrador.)
+async function withRequests(dtos) {
+  const tokens = new Map();
+  for (const dto of dtos) {
+    const match = dto.kind === 'text' && dto.text ? dto.text.match(REQUEST_LINK) : null;
+    if (match) tokens.set(dto._id, match[1]);
+  }
+  if (!tokens.size) return dtos;
+  const found = await LoanRequest.find({ token: { $in: [...new Set(tokens.values())] } })
+    .select('token status bookTitle personName')
+    .lean();
+  const byToken = new Map(found.map((request) => [request.token, request]));
+  return dtos.map((dto) => {
+    const token = tokens.get(dto._id);
+    if (!token) return dto;
+    const request = byToken.get(token);
+    return {
+      ...dto,
+      request: {
+        token,
+        state: !request ? 'gone' : request.status === 'pendente' ? 'pending' : 'registered',
+        bookTitle: request?.bookTitle || '',
+        personName: request?.status === 'pendente' ? '' : request?.personName || '',
+      },
+    };
+  });
+}
+
 // O robo esta quieto nesta conversa agora? (o modo humano vence sozinho)
 function attendanceOf(chat) {
   const until = chat.humanUntil ? new Date(chat.humanUntil) : null;
@@ -125,6 +159,8 @@ function attendanceOf(chat) {
     // Pediu um administrador e ninguem respondeu ainda.
     waiting: Boolean(human && chat.handoffAt),
     waitingSince: human && chat.handoffAt ? chat.handoffAt : null,
+    // Por que espera: "request" (pedido de emprestimo do acervo) ou "admin".
+    reason: human && chat.handoffAt ? (chat.handoffReason === 'request' ? 'request' : 'admin') : '',
     // O freio silenciou o robo aqui (muitas mensagens seguidas).
     muted: Boolean(!human && chat.botMutedUntil && new Date(chat.botMutedUntil).getTime() > Date.now()),
   };
@@ -362,7 +398,7 @@ router.get('/chats/:id/messages', readLimiter, async (req, res, next) => {
       const truncated = changed.length > MAX_CHANGES;
       const page = truncated ? changed.slice(0, MAX_CHANGES) : changed;
       return res.json({
-        messages: page.map(messageDto),
+        messages: await withRequests(page.map(messageDto)),
         now: truncated ? page[page.length - 1].updatedAt : now,
         hasMore: truncated,
       });
@@ -380,11 +416,23 @@ router.get('/chats/:id/messages', readLimiter, async (req, res, next) => {
       .lean();
     const hasMore = page.length > limit;
     const messages = page.slice(0, limit).reverse();
-    return res.json({ messages: messages.map(messageDto), now, hasMore });
+    return res.json({ messages: await withRequests(messages.map(messageDto)), now, hasMore });
   } catch (error) {
     return next(error);
   }
 });
+
+/**
+ * A mensagem do painel com o nome de quem esta falando, em negrito, na
+ * primeira linha: "*Bruno Henrique:*\nOlá...". O nome e o primeiro nome e o
+ * primeiro sobrenome; com "de/da/do/das/dos" vai o seguinte tambem ("Maria da
+ * Silva", nao "Maria da") - a mesma regra de shortName (services/people.js).
+ * Sem nome (conta sem nome), sai so o texto.
+ */
+export function signedText(fullName, text) {
+  const name = shortName(String(fullName || '').replace(/[*_~`]/g, ' '));
+  return name ? '*' + name + ':*\n' + text : text;
+}
 
 // Depois de um envio sem resposta a tempo: se a mensagem apareceu (o WhatsApp
 // avisa das mensagens enviadas), ela passa a valer como a cobranca; se nao
@@ -403,6 +451,8 @@ function checkAmbiguousCharge({ chatId, loanId, text, startedAt, charge, account
           { _id: echo._id },
           { $set: { chargeLoan: loanId, sentBy: account._id, sentByName: account.fullName } }
         );
+        // Agora e "do painel": a previa da lista sai sem a linha do nome.
+        await refreshLastMessage(chatId);
       } else {
         await undoCharge(loanId, charge);
       }
@@ -422,13 +472,13 @@ router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
   let loanId = null;
   try {
     const raw = typeof req.body?.text === 'string' ? req.body.text : '';
-    const text = raw
+    const typed = raw
       .replace(/\r\n?/g, '\n')
       // eslint-disable-next-line no-control-regex
       .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
       .trim();
-    if (!text) return res.status(400).json({ error: 'Escreva a mensagem.' });
-    if (text.length > MAX_TEXT) {
+    if (!typed) return res.status(400).json({ error: 'Escreva a mensagem.' });
+    if (typed.length > MAX_TEXT) {
       return res
         .status(400)
         .json({ error: 'A mensagem passa de ' + MAX_TEXT + ' letras. Divida em duas.' });
@@ -436,6 +486,11 @@ router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
 
     const chat = await WaChat.findById(req.params.id);
     if (!chat) return res.status(404).json({ error: 'Conversa não encontrada.' });
+
+    // A pessoa ve quem esta falando: a mensagem sai com o nome do
+    // administrador em negrito na primeira linha (ver signedText). E o que
+    // vai e o que fica gravado (o painel mostra o mesmo que a pessoa recebeu).
+    const text = signedText(req.account.fullName, typed);
 
     // Antes de mexer na cobranca: da para enviar agora?
     await whatsapp.assertCanSend();
@@ -491,6 +546,8 @@ router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
         sentBy: req.account._id,
         sentByName: req.account.fullName,
         chargeLoan: charge ? loanId : null,
+        // A lista mostra o que foi digitado, sem o nome (o "Você:" ja diz).
+        preview: typed,
       }));
       await WaChat.updateOne(
         { _id: chat._id },

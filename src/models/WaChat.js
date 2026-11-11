@@ -48,6 +48,16 @@ const waChatSchema = new mongoose.Schema(
     mode: { type: String, enum: ['bot', 'human'], default: 'bot' },
     humanUntil: { type: Date, default: null },
     handoffAt: { type: Date, default: null, index: true },
+    // Por que esta esperando: "admin" (pediu um administrador no menu) ou
+    // "request" (mandou um pedido de emprestimo do acervo publico).
+    handoffReason: { type: String, default: '' },
+    // Avisos de pedido de emprestimo mandados ao administrador por esta
+    // conversa nas ultimas 24 h (freio contra enxurrada) e o ultimo pedido
+    // sem link (para a mesma mensagem repetida nao avisar duas vezes).
+    requestDayAt: { type: Date, default: null },
+    requestDayCount: { type: Number, default: 0 },
+    lastRequestKey: { type: String, default: '' },
+    lastRequestAt: { type: Date, default: null },
     // Onde a pessoa esta no menu do robo (step + dados do passo) e ate quando.
     botStep: { type: String, default: '' },
     botData: { type: mongoose.Schema.Types.Mixed, default: null },

@@ -22,14 +22,9 @@ async function mergeChats(from, into) {
       await WaMessage.deleteOne({ _id: message._id });
     }
   }
-  const last = await WaMessage.findOne({ chat: into._id }).sort({ at: -1 }).lean();
+  // (A "ultima mensagem" e recalculada no fim, por refreshLastMessage: assim a
+  // previa segue as mesmas regras - apagada, assinatura do painel.)
   const set = {};
-  if (last) {
-    set.lastMessageAt = last.at;
-    set.lastMessageText = previewOf(last.kind, last.text);
-    set.lastMessageKind = last.kind;
-    set.lastMessageFromMe = last.fromMe;
-  }
   // Atendimento humano em curso na conversa que some passa para a que fica
   // (senao o "Aguardando administrador" sumiria e o robo responderia no meio).
   const fromUntil = from.humanUntil ? new Date(from.humanUntil).getTime() : 0;
@@ -43,8 +38,9 @@ async function mergeChats(from, into) {
   }
   await WaChat.updateOne(
     { _id: into._id },
-    { $set: set, $inc: { unread: from.unread || 0 } }
+    { ...(Object.keys(set).length ? { $set: set } : {}), $inc: { unread: from.unread || 0 } }
   );
+  await refreshLastMessage(into._id);
   await WaChat.deleteOne({ _id: from._id });
 }
 
@@ -144,6 +140,9 @@ export async function saveMessage(
     chargeLoan = null,
     auto = '',
     countUnread = false,
+    // O que a lista de conversas mostra como "ultima mensagem", se nao for o
+    // proprio texto (a mensagem do painel sem a linha do nome de quem enviou).
+    preview = null,
   }
 ) {
   const when = at instanceof Date ? at : new Date(at || Date.now());
@@ -169,6 +168,18 @@ export async function saveMessage(
   const inserted = result.upsertedCount === 1;
   if (!inserted && fromMe) await raiseStatus(chat._id, waId, status);
 
+  // O eco do WhatsApp chegou antes e ja gravou a mensagem (com o texto
+  // inteiro): a lista passa a mostrar a previa certa, se ela ainda e a ultima.
+  if (!inserted && preview !== null) {
+    const saved = await WaMessage.findOne({ chat: chat._id, waId }).select('at').lean();
+    if (saved) {
+      await WaChat.updateOne(
+        { _id: chat._id, lastMessageAt: saved.at },
+        { $set: { lastMessageText: previewOf(kind, preview) } }
+      );
+    }
+  }
+
   if (inserted) {
     await WaChat.updateOne(
       {
@@ -178,7 +189,7 @@ export async function saveMessage(
       {
         $set: {
           lastMessageAt: when,
-          lastMessageText: previewOf(kind, text),
+          lastMessageText: previewOf(kind, preview ?? text),
           lastMessageKind: kind,
           lastMessageFromMe: fromMe,
         },
@@ -256,7 +267,12 @@ export async function refreshLastMessage(chatId) {
             lastMessageAt: last.at,
             lastMessageText: last.deleted
               ? 'Mensagem apagada'
-              : previewOf(last.kind, last.text),
+              : previewOf(
+                  last.kind,
+                  // Do painel: sem a linha do nome de quem enviou (ver
+                  // signedText em routes/whatsapp.js).
+                  last.sentBy ? String(last.text || '').replace(/^\*[^*\n]+:\*\n/, '') : last.text
+                ),
             lastMessageKind: last.kind,
             lastMessageFromMe: last.fromMe,
           },

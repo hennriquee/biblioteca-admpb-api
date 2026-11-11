@@ -42,6 +42,11 @@ const EXTENSION_BY_NAME = 'WhatsApp (pedido do leitor)';
 
 const FALSY = new Set(['false', '0', 'no', 'off', 'nao', 'não']);
 
+// O WhatsApp BRASILEIRO da biblioteca: para onde ia o "Combinar" do acervo
+// publico antes do robo (modelo antigo, guardado como reserva: ver
+// requestChannel abaixo) e quem recebe hoje o aviso de pedido de emprestimo.
+export const LEGACY_REQUESTS_WHATSAPP = '5534984241556';
+
 export function readBotConfig(env = process.env) {
   const site =
     String(env.PUBLIC_SITE_URL || '').trim() ||
@@ -56,6 +61,17 @@ export function readBotConfig(env = process.env) {
     enabled: !FALSY.has(String(env.WHATSAPP_BOT_ENABLED ?? '').trim().toLowerCase()),
     // Bruno Henrique: recebe o aviso de "quer falar com um administrador".
     adminPhone: digitsOf(env.WHATSAPP_ADMIN_NUMBER || '5534996560351'),
+    // Recebe o aviso de PEDIDO DE EMPRESTIMO (o "Combinar" do acervo publico):
+    // o WhatsApp brasileiro que recebia essas mensagens antes do robo.
+    requestsAdminPhone: digitsOf(env.WHATSAPP_REQUESTS_ADMIN_NUMBER || LEGACY_REQUESTS_WHATSAPP),
+    // "digitando…" antes de cada resposta: base + um pouco por letra, ate o teto.
+    typingMs: FALSY.has(String(env.WHATSAPP_BOT_TYPING ?? '').trim().toLowerCase()) ? 0 : 1200,
+    // "online": fica online so durante a resposta (ver setTyping em service.js).
+    typingOnline: String(env.WHATSAPP_BOT_TYPING ?? '').trim().toLowerCase() === 'online',
+    typingPerCharMs: 8,
+    typingMaxMs: 3000,
+    // Freio dos avisos de pedido de emprestimo: por conversa, em 24 h.
+    maxRequestNoticesPerDay: 8,
     siteUrl: site.replace(/\/+$/, ''),
     // Quantos dias cada extensao pelo WhatsApp acrescenta a devolucao.
     extensionDays: Number.isInteger(days) && days > 0 && days <= 60 ? days : 7,
@@ -66,6 +82,8 @@ export function readBotConfig(env = process.env) {
     // Mensagem mais velha que isto (chegou com o servidor fora do ar) nao
     // recebe resposta automatica: ficaria fora de contexto.
     maxAgeMs: 6 * 60 * 60 * 1000,
+    // Pedido de emprestimo atrasado ainda avisa o administrador ate isto.
+    maxRequestAgeMs: 7 * 24 * 60 * 60 * 1000,
     humanMs: 12 * 60 * 60 * 1000,
     // Pedido de administrador sem resposta: o robo volta depois disto.
     handoffMs: 24 * 60 * 60 * 1000,
@@ -83,16 +101,24 @@ export function readBotConfig(env = process.env) {
 
 // ---------- Textos ----------
 
-const GREETING = 'Olá, aqui é da Biblioteca ADMP Brasil. Como posso ajudar?';
+// O numero da opcao como emoji (1️⃣, 2️⃣, 0️⃣...): digito + "️" + "⃣".
+// Quem responde tocando no emoji tambem e entendido (ver KEYCAP).
+export function key(n) {
+  return String(n) + '️⃣';
+}
+
+const GREETING = 'Olá, aqui é da Biblioteca ADMP Brasil. 📚 Como posso ajudar?';
 
 const MAIN_OPTIONS = [
-  '*1* – Conhecer o catálogo',
-  '*2* – Empréstimos',
-  '*3* – Falar com um administrador',
+  key(1) + ' Conhecer o catálogo',
+  key(2) + ' Empréstimos',
+  key(3) + ' Falar com um administrador',
 ].join('\n');
 
 const REPLY_HINT = 'Responda com o número da opção.';
-const BACK = '*0* – Voltar ao menu';
+const BACK = key(0) + ' Voltar ao menu';
+const BACK_HINT = 'Digite ' + key(0) + ' para voltar ao menu.';
+const CONFIRM_OPTIONS = key(1) + ' Confirmar\n' + key(0) + ' Cancelar';
 const NOT_UNDERSTOOD = 'Não entendi. Por favor, selecione uma opção válida.';
 
 function mainMenu({ greet = false } = {}) {
@@ -100,10 +126,14 @@ function mainMenu({ greet = false } = {}) {
 }
 
 const LOANS_MENU =
-  '*Empréstimos*\n\n*1* – Ver meus empréstimos ativos\n*2* – Estender a data de devolução\n' +
+  '*Empréstimos*\n\n' +
+  key(1) +
+  ' Ver meus empréstimos ativos\n' +
+  key(2) +
+  ' Estender a data de devolução\n' +
   BACK;
 
-const HANDOFF_OPTIONS = '*1* – Falar com um administrador\n' + BACK;
+const HANDOFF_OPTIONS = key(1) + ' Falar com um administrador\n' + BACK;
 
 function bold(text) {
   // O titulo vai entre asteriscos (negrito no WhatsApp): tira os asteriscos
@@ -147,6 +177,12 @@ export function parseChoice(text) {
   if (!value || value.length > 30) return {};
   const digit = value.match(/^(?:opcao|opc|op|numero|n)?\s*[#(]?\s*(\d{1,2})\s*[).:-]?\s*[.!]?$/);
   if (digit) return { digit: Number(digit[1]) };
+  // A linha da opcao copiada inteira ("0️⃣ Voltar ao menu", "2️⃣ Estender a
+  // data de devolução"): vale o numero do comeco.
+  const line = value.match(
+    /^(\d)\s*[-–.)]?\s*(conhecer|emprestimos|falar|ver|estender|voltar|confirmar|cancelar)\b/
+  );
+  if (line) return { digit: Number(line[1]) };
   const word = value.replace(/[^a-z ]/g, '').trim();
   if (['menu', 'inicio', 'menu principal', 'voltar', 'comecar', 'recomecar'].includes(word)) {
     return { word: 'menu' };
@@ -191,6 +227,54 @@ function loansWord(text) {
   if (extend && !list) return 2;
   if (list && !extend) return 1;
   return undefined;
+}
+
+// ---------- Pedido de emprestimo do acervo publico ----------
+
+// O link do fim da mensagem: /solicitacao/<id> (o id e o mesmo formato de
+// TOKEN_PATTERN em routes/requests.js).
+export const REQUEST_LINK = /\/solicitacao\/([A-Za-z0-9_-]{16,64})(?![A-Za-z0-9_-])/;
+// O texto pronto (utils/whatsapp.js no front, buildRequestMessage): vale
+// mesmo sem o link (servidor fora do ar na hora do pedido).
+const REQUEST_BOOK = /gostaria de pegar emprestado o livro\s*["“”]([^"“”\n]{1,200})["“”]/i;
+const REQUEST_NAME = /meu nome [eé]\s+(.{2,80}?)\s+(\*?\(novo cadastro\)\*?\s+)?e gostaria de pegar emprestado/i;
+
+// Texto que a PESSOA digitou (nome, titulo, nome do perfil) indo para um
+// aviso mandado pelo numero da biblioteca: o aviso nao pode carregar um link
+// "oficial" de golpe. Em vez de apagar (o que apagaria tambem "Vol.II" ou
+// "Sr.Marcos"), DESARMA: tira "http://", "https://" e "www." e troca o ponto
+// entre letras por "․" (U+2024, parecido, que o WhatsApp nao transforma em
+// link). Antes, a formatacao do WhatsApp e as quebras viram espaco (senao
+// "go_lpe.com" escaparia). Numa linha so.
+export function typedText(value, max = 120) {
+  return String(value || '')
+    .replace(/[*_~`\n\r\t]/g, ' ')
+    .replace(/(?:https?:\/\/|www\.)/gi, ' ')
+    // (os pontos "orientais" tambem: alguns aparelhos os leem como ".")
+    .replace(/([\p{L}\p{N}-])[.。．｡](?=[\p{L}\p{N}-])/gu, '$1․')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max)
+    .trim();
+}
+
+/**
+ * { token, title, name, isNew } se a mensagem e um pedido de emprestimo do
+ * acervo publico (pelo link ou pelo texto pronto), ou null.
+ */
+export function parseRequestMessage(text) {
+  const value = String(text || '');
+  if (!value || value.length > 3000) return null;
+  const link = value.match(REQUEST_LINK);
+  const book = value.match(REQUEST_BOOK);
+  if (!link && !book) return null;
+  const name = value.match(REQUEST_NAME);
+  return {
+    token: link ? link[1] : '',
+    title: book ? book[1].trim() : '',
+    name: name ? name[1].replace(/[*_~`]/g, '').trim() : '',
+    isNew: Boolean(name?.[2]),
+  };
 }
 
 // ---------- O robo ----------
@@ -294,12 +378,36 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
     ]);
   }
 
+  // "digitando…" na conversa por um instante antes da resposta, como uma
+  // pessoa (mais tempo para texto maior, ate o teto). Sem conexao ou sem o
+  // recurso (testes), segue direto.
+  async function typeFirst(chat, text) {
+    if (!cfg.typingMs || typeof whatsapp.setTyping !== 'function') return false;
+    if (!(await whatsapp.setTyping(chat, true, { online: cfg.typingOnline }))) return false;
+    const ms = Math.min(cfg.typingMaxMs, cfg.typingMs + String(text).length * cfg.typingPerCharMs);
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    return true;
+  }
+
   async function reply(chat, text) {
     if (!(await canReply(chat))) {
       console.warn('WhatsApp: atendimento automático silenciado numa conversa (muitas mensagens seguidas).');
       return false;
     }
-    await sendAutomatic(chat, text, 'bot');
+    const typing = await typeFirst(chat, text);
+    try {
+      await sendAutomatic(chat, text, 'bot');
+    } catch (error) {
+      // A mensagem nao saiu: tira o "digitando…" (senao fica ate o WhatsApp
+      // vencer o sinal sozinho).
+      if (typing) whatsapp.setTyping(chat, false, { online: cfg.typingOnline }).catch(() => {});
+      throw error;
+    }
+    // Saiu: a mensagem ja tira o "digitando…". No modo "online", volta a
+    // "offline" (o celular volta a receber as notificacoes).
+    if (typing && cfg.typingOnline) {
+      whatsapp.setTyping(chat, false, { online: true }).catch(() => {});
+    }
     await countReply(chat);
     return true;
   }
@@ -411,7 +519,8 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
         (link
           ? 'Acesse o catálogo da biblioteca:\n' + link
           : 'O catálogo da biblioteca está disponível no site da biblioteca.') +
-          '\n\nDigite *0* para voltar ao menu.'
+          '\n\n' +
+          BACK_HINT
       );
       return;
     }
@@ -433,7 +542,7 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
     }
     if (!loans.length) {
       await setStep(chat, 'done');
-      await reply(chat, 'Você não possui empréstimos ativos no momento.\n\nDigite *0* para voltar ao menu.');
+      await reply(chat, 'Você não possui empréstimos ativos no momento.\n\n' + BACK_HINT);
       return;
     }
     await setStep(chat, 'loans');
@@ -450,7 +559,9 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
       (loans.length === 1 ? 'Seu empréstimo ativo:' : 'Seus empréstimos ativos:') +
         '\n\n' +
         loans.map((loan) => loanLine(loan, manyOwners(loans))).join('\n') +
-        '\n\n*2* – Estender a data de devolução\n' +
+        '\n\n' +
+        key(2) +
+        ' Estender a data de devolução\n' +
         BACK
     );
   }
@@ -469,7 +580,7 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
         shown
           .map(
             (loan, index) =>
-              '*' + (index + 1) + '* – ' + loanLine(loan, manyOwners(shown)).slice(2)
+              key(index + 1) + ' ' + loanLine(loan, manyOwners(shown)).slice(2)
           )
           .join('\n') +
         '\n' +
@@ -493,7 +604,8 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
         brDate(check.from) +
         '\nNova devolução: ' +
         brDate(check.to) +
-        '\n\n*1* – Confirmar\n*0* – Cancelar'
+        '\n\n' +
+        CONFIRM_OPTIONS
     );
   }
 
@@ -544,7 +656,8 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
         bold(loan.bookTitle) +
         ' é ' +
         brDate(check.to) +
-        '.\n\nDigite *0* para voltar ao menu.'
+        '.\n\n' +
+        BACK_HINT
     );
   }
 
@@ -559,6 +672,7 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
           mode: 'human',
           humanUntil: new Date(now() + cfg.handoffMs),
           handoffAt: alreadyAsked ? chat.handoffAt : at,
+          handoffReason: alreadyAsked && chat.handoffReason ? chat.handoffReason : 'admin',
           botStep: '',
           botData: null,
           botAt: at,
@@ -610,22 +724,263 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
     }
   }
 
+  // ---------- Pedido de emprestimo (o "Combinar" do acervo publico) ----------
+
+  // Mais um aviso de pedido por esta conversa cabe no freio do dia? (Conta
+  // so se couber: a mesma conta e feita de uma vez no banco.)
+  async function takeRequestNotice(chat) {
+    const dayStart = new Date(now() - 24 * 60 * 60 * 1000);
+    const t = new Date(now());
+    const fresh = await WaChat.findOneAndUpdate(
+      {
+        _id: chat._id,
+        $or: [
+          { requestDayAt: null },
+          { requestDayAt: { $lte: dayStart } },
+          { requestDayCount: { $lt: cfg.maxRequestNoticesPerDay } },
+        ],
+      },
+      [
+        {
+          $set: {
+            requestDayCount: {
+              $cond: [
+                { $gt: [{ $ifNull: ['$requestDayAt', new Date(0)] }, dayStart] },
+                { $add: [{ $ifNull: ['$requestDayCount', 0] }, 1] },
+                1,
+              ],
+            },
+            requestDayAt: {
+              $cond: [
+                { $gt: [{ $ifNull: ['$requestDayAt', new Date(0)] }, dayStart] },
+                '$requestDayAt',
+                t,
+              ],
+            },
+          },
+        },
+      ],
+      { new: true }
+    ).lean();
+    return Boolean(fresh);
+  }
+
+  async function notifyRequest(chat, { request, parsed, title }) {
+    if (!cfg.requestsAdminPhone) return;
+    try {
+      if (!(await takeRequestNotice(chat))) {
+        console.warn('WhatsApp: muitos pedidos de empréstimo da mesma conversa hoje; aviso ao administrador não enviado.');
+        return;
+      }
+      // O nome e o titulo sem a solicitacao no banco sao o que a pessoa DIGITOU
+      // na mensagem (marcados como tal). O nome do formulario tambem foi
+      // digitado por ela: todos passam por typedText (sem link clicavel).
+      const name =
+        (typedText(request?.requesterName) ||
+          typedText(parsed.name) ||
+          typedText(chat.pushName) ||
+          'Contato sem nome') +
+        (request ? (request.requesterIsNew ? ' (novo cadastro)' : '') : parsed.isNew ? ' (novo cadastro)' : '');
+      const phone = prettyPhone(chat.phone);
+      const day = request?.pickupDate ? dayOf(request.pickupDate) : '';
+      const approve =
+        request && cfg.siteUrl ? cfg.siteUrl + '/solicitacao/' + encodeURIComponent(request.token) : '';
+      const conversation = cfg.siteUrl ? cfg.siteUrl + '/conversas/' + chat._id : '';
+      const admin = await resolveChat({ phone: cfg.requestsAdminPhone });
+      if (!admin) return;
+      await sendAutomatic(
+        admin,
+        '*Biblioteca ADMP Brasil – pedido de empréstimo* 📚\n\n' +
+          name +
+          ' quer pegar emprestado ' +
+          bold(title) +
+          '.' +
+          (phone ? '\nWhatsApp: ' + phone : '') +
+          (day ? '\nDia de preferência para pegar: ' + brDate(day) : '') +
+          (request ? '' : '\n(nome e livro como a pessoa escreveu na mensagem)') +
+          (approve
+            ? '\n\nAprovar a solicitação e preencher as datas no painel:\n' + approve
+            : request
+              ? ''
+              : parsed.token
+                ? '\n\nO link desta solicitação não vale mais (já foi registrada, virou empréstimo, foi excluída ou venceu): confira em Empréstimos › Solicitados.'
+                : '\n\nO pedido chegou sem o link da solicitação: registre em Empréstimos › Solicitados.') +
+          (conversation ? '\n\nConversa no painel:\n' + conversation : ''),
+        'request'
+      );
+    } catch (error) {
+      // O pedido continua marcado no painel ("Pedido de empréstimo").
+      console.error('WhatsApp: não foi possível avisar o administrador do pedido:', error.message);
+    }
+  }
+
+  /**
+   * A mensagem e o pedido pronto do acervo publico ("gostaria de pegar
+   * emprestado o livro ..." com o link /solicitacao/<id>): o robo confirma
+   * para a pessoa, passa a conversa para um administrador e avisa o
+   * administrador dos pedidos. quiet: um administrador ja esta conversando
+   * aqui (o robo nao se mete; so o aviso sai). Devolve false quando nao e um
+   * pedido de verdade (link que nao existe e sem o texto do pedido): segue o
+   * atendimento normal.
+   */
+  async function handleRequest(chat, parsed, { quiet = false, staff = false } = {}) {
+    let request = parsed.token ? await LoanRequest.findOne({ token: parsed.token }).lean() : null;
+    const typedTitle = typedText(parsed.title);
+    if (!request && !typedTitle) return false;
+    const title = request?.bookTitle || typedTitle;
+    // O link ja chegou por OUTRA conversa: aqui nao se usa o nome de la.
+    const otherChat = request?.waChat && String(request.waChat) !== String(chat._id);
+    // Alguem da equipe colou aqui o link de um pedido que ja chegou por outra
+    // conversa (copiado do aviso): nao e um pedido dele. Fica quieto.
+    if (staff && otherChat) return true;
+    const first = firstName(
+      (!otherChat && request?.requesterName) || typedText(parsed.name) || typedText(chat.pushName)
+    );
+
+    // A equipe ja registrou (a pessoa mandou a mensagem de novo depois).
+    if (request && request.status !== 'pendente') {
+      if (quiet) return true;
+      await setStep(chat, 'done');
+      await reply(
+        chat,
+        'A sua solicitação do livro ' +
+          bold(title) +
+          ' já foi registrada pela equipe da biblioteca' +
+          (request.pickupDate ? ' (retirada prevista em ' + brDate(dayOf(request.pickupDate)) + ')' : '') +
+          '. 📚\n\n' +
+          BACK_HINT
+      );
+      return true;
+    }
+
+    // Um aviso por link: o mesmo link de novo (mensagem repetida) nao avisa
+    // outra vez. Sem link, a mesma mensagem em 30 minutos tambem nao. O link
+    // fica com a PRIMEIRA conversa que o mandou: outra conversa mandando o
+    // mesmo link (encaminhado, ou o mesmo nome pedindo o mesmo livro) recebe a
+    // resposta, mas nao toma o link nem gera aviso novo.
+    let notify;
+    if (request) {
+      const claimed = await LoanRequest.findOneAndUpdate(
+        {
+          _id: request._id,
+          status: 'pendente',
+          waNotifiedAt: null,
+          $or: [{ waChat: null }, { waChat: chat._id }],
+        },
+        { $set: { waNotifiedAt: new Date(now()), waChat: chat._id, waPhone: chat.phone || '' } },
+        { new: true }
+      ).lean();
+      notify = Boolean(claimed);
+      if (claimed) request = claimed;
+    } else {
+      const requestKey = normalizeInput(title + '|' + (parsed.name || ''));
+      const repeated =
+        chat.lastRequestKey === requestKey &&
+        chat.lastRequestAt &&
+        now() - new Date(chat.lastRequestAt).getTime() < 30 * 60 * 1000;
+      notify = !repeated;
+      if (notify) {
+        await WaChat.updateOne(
+          { _id: chat._id },
+          { $set: { lastRequestKey: requestKey, lastRequestAt: new Date(now()) } }
+        );
+      }
+    }
+
+    // A conversa passa para um administrador (o robo fica quieto) e aparece
+    // no painel como "Pedido de empréstimo".
+    const at = new Date(now());
+    const humanUntil = Math.max(
+      now() + cfg.handoffMs,
+      chat.mode === 'human' && chat.humanUntil ? new Date(chat.humanUntil).getTime() : 0
+    );
+    await WaChat.updateOne(
+      { _id: chat._id },
+      {
+        $set: {
+          mode: 'human',
+          humanUntil: new Date(humanUntil),
+          handoffAt: chat.mode === 'human' && chat.handoffAt ? chat.handoffAt : at,
+          handoffReason: 'request',
+          botStep: '',
+          botData: null,
+          botAt: at,
+        },
+      }
+    );
+
+    try {
+      if (!quiet) {
+        await reply(
+          chat,
+          'Olá' +
+            (first ? ', ' + first : '') +
+            '! Recebemos o seu pedido do livro ' +
+            bold(title) +
+            '. 📚\n\n' +
+            'Vou passar o seu pedido para um de nossos administradores, que entrará em contato com você assim que possível.'
+        );
+      }
+    } finally {
+      // O administrador e avisado mesmo se a resposta a pessoa falhar.
+      if (notify) await notifyRequest(chat, { request, parsed, title });
+    }
+    return true;
+  }
+
   // ---------- Entrada de cada mensagem ----------
 
   async function handle({ chat: eventChat, message, text, kind }) {
     if (!cfg.enabled || !whatsapp.isOpen()) return;
     const at = message?.at ? new Date(message.at).getTime() : now();
-    if (now() - at > cfg.maxAgeMs) return;
+    const age = now() - at;
+    // Pedido de emprestimo pronto do acervo publico: vem antes de tudo (vale
+    // ate com um administrador ja na conversa ou com o robo silenciado - e um
+    // pedido explicito, nao um "ok").
+    const request = kind === 'text' ? parseRequestMessage(text) : null;
+    // Pedido que chegou atrasado (o servidor ficou fora do ar por horas): o
+    // administrador ainda e avisado, mas a pessoa nao recebe a resposta
+    // automatica (sairia fora de hora). Mais velho que isto, nem o aviso.
+    const lateRequest = request && age > cfg.maxAgeMs && age <= cfg.maxRequestAgeMs;
+    if (age > cfg.maxAgeMs && !lateRequest) return;
 
     let chat = await WaChat.findById(eventChat._id).lean();
     if (!chat) return;
+
+    // O numero que recebe os avisos (ou o do administrador) reencaminhando o
+    // proprio aviso de pedido para ca nao vira um pedido novo.
+    const staff = [cfg.adminPhone, cfg.requestsAdminPhone].some(
+      (phone) => phone && samePhone(chat.phone, phone)
+    );
+    const forwardedNotice = staff && /pedido de empr[ée]stimo/i.test(String(text).slice(0, 120));
+
+    if (request && !forwardedNotice) {
+      const humanActive =
+        chat.mode === 'human' && chat.humanUntil && new Date(chat.humanUntil).getTime() > now();
+      const muted = chat.botMutedUntil && new Date(chat.botMutedUntil).getTime() > now();
+      // Administrador conversando (sem pedido esperando), robo silenciado ou
+      // pedido atrasado: a pessoa nao recebe a resposta automatica, so o
+      // administrador e avisado.
+      const quiet = Boolean((humanActive && !chat.handoffAt) || muted || lateRequest);
+      if (await handleRequest(chat, request, { quiet, staff })) return;
+    }
+    if (age > cfg.maxAgeMs) return;
 
     if (chat.mode === 'human') {
       if (chat.humanUntil && new Date(chat.humanUntil).getTime() > now()) return;
       // O atendimento humano venceu: o robo volta, do comeco.
       await WaChat.updateOne(
         { _id: chat._id, mode: 'human' },
-        { $set: { mode: 'bot', humanUntil: null, handoffAt: null, botStep: '', botData: null } }
+        {
+          $set: {
+            mode: 'bot',
+            humanUntil: null,
+            handoffAt: null,
+            handoffReason: '',
+            botStep: '',
+            botData: null,
+          },
+        }
       );
       chat = await WaChat.findById(chat._id).lean();
       if (!chat || chat.mode !== 'bot') return;
@@ -652,9 +1007,8 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
     // O numero do administrador recebe os avisos de atendimento: responder
     // "ok" a um aviso nao pode puxar o menu. Para testar o robo por ele,
     // basta mandar "menu".
-    if (cfg.adminPhone && samePhone(chat.phone, cfg.adminPhone) && expired && choice.word !== 'menu') {
-      return;
-    }
+    // (Vale tambem para o numero que recebe os avisos de pedido de emprestimo.)
+    if (staff && expired && choice.word !== 'menu') return;
 
     if (expired) return showMain(chat, { greet: true });
 
@@ -702,7 +1056,7 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
       case 'confirm': {
         if (digit === 1) return confirmExtension(chat, chat.botData);
         if (digit === 0) return openLoans(chat, { prefix: 'Extensão cancelada.' });
-        await reply(chat, NOT_UNDERSTOOD + '\n\n*1* – Confirmar\n*0* – Cancelar');
+        await reply(chat, NOT_UNDERSTOOD + '\n\n' + CONFIRM_OPTIONS);
         return undefined;
       }
       case 'blocked': {
@@ -725,6 +1079,7 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
           mode: 'human',
           humanUntil: new Date(now() + cfg.humanMs),
           handoffAt: null,
+          handoffReason: '',
           botStep: '',
           botData: null,
         },
@@ -766,3 +1121,46 @@ export function createBot({ whatsapp, config: overrides = {}, now = () => Date.n
 
 /** O atendimento que o servidor usa (ligado em server.js). */
 export const bot = createBot({ whatsapp: defaultWhatsapp });
+
+// Reconectando ha mais que isto, o "Combinar" vai para o brasileiro: a
+// mensagem para o +54 ficaria horas sem resposta.
+const RECONNECT_GRACE_MS = 15 * 60 * 1000;
+
+// O WhatsApp da biblioteca recebe agora (ou vai receber em instantes)?
+// - aberto, ou outra copia do servidor com a conexao (standby, no deploy);
+// - conectando/reconectando COM sessao salva e fora do ar ha pouco tempo
+//   (servidor acordando, queda rapida). Sem sessao, conectando e o QR.
+function receivingSoon(status, now) {
+  if (status.state === 'open' || status.state === 'standby') return true;
+  if (status.state !== 'connecting' && status.state !== 'reconnecting') return false;
+  if (!status.hasSession) return false;
+  const down = status.downSince ? Date.parse(status.downSince) : NaN;
+  return Number.isFinite(down) && now - down < RECONNECT_GRACE_MS;
+}
+
+/**
+ * Para qual WhatsApp vai o "Combinar" do acervo publico:
+ * - "robo" (padrao): o numero da biblioteca conectado ao painel (+54), onde o
+ *   robo confirma o pedido e avisa o administrador dos pedidos;
+ * - "brasil": o MODELO ANTIGO, guardado como reserva - a mensagem vai direto
+ *   para o WhatsApp brasileiro (LIBRARY_WHATSAPP_BR), e a equipe combina por
+ *   la, como antes do robo. Escolhido com REQUESTS_WHATSAPP=brasil no Render.
+ * Mesmo no "robo", se o WhatsApp da biblioteca nao esta conectado (QR por
+ * ler, sessao quebrada, desligado) ou o robo esta desligado, vai para o
+ * brasileiro: ninguem fica sem resposta.
+ * Devolve { number, via: "robo" | "brasil" }.
+ */
+export function requestChannel({
+  env = process.env,
+  whatsapp = defaultWhatsapp,
+  botConfig = bot.config,
+  now = Date.now(),
+} = {}) {
+  const legacy = digitsOf(env.LIBRARY_WHATSAPP_BR || LEGACY_REQUESTS_WHATSAPP);
+  const mode = String(env.REQUESTS_WHATSAPP || 'robo').trim().toLowerCase();
+  if (mode === 'brasil' || !botConfig.enabled) return { number: legacy, via: 'brasil' };
+  const status = whatsapp.snapshot();
+  const ready = status.enabled && !status.broken && receivingSoon(status, now);
+  const number = digitsOf(whatsapp.config?.number || status.number);
+  return ready && number ? { number, via: 'robo' } : { number: legacy, via: 'brasil' };
+}
