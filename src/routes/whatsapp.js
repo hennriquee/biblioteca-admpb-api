@@ -4,8 +4,12 @@ import rateLimit from 'express-rate-limit';
 import Loan from '../models/Loan.js';
 import LoanRequest from '../models/LoanRequest.js';
 import Person from '../models/Person.js';
+import WaAnswer from '../models/WaAnswer.js';
 import WaChat from '../models/WaChat.js';
 import WaMessage from '../models/WaMessage.js';
+import WaUnknown from '../models/WaUnknown.js';
+import { fold as foldText } from '../services/whatsapp/intents.js';
+import { contentFindings } from '../services/whatsapp/policy.js';
 import { requireAdmin } from '../middleware/auth.js';
 import { normalizeText } from '../models/Book.js';
 import { allWordsRegex, escapeRegex } from '../services/search.js';
@@ -266,7 +270,12 @@ async function totalUnread() {
 // GET /api/whatsapp/status - situacao, QR (quando espera a leitura) e nao lidas
 router.get('/status', readLimiter, async (req, res, next) => {
   try {
-    return res.json({ ...whatsapp.snapshot(), unread: await totalUnread() });
+    return res.json({
+      ...whatsapp.snapshot(),
+      unread: await totalUnread(),
+      // Aquecimento e pausa do fiscal (policy.js): tetos do dia.
+      protection: await whatsapp.policyStatus().catch(() => null),
+    });
   } catch (error) {
     return next(error);
   }
@@ -550,7 +559,8 @@ router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
     let sent;
     const startedAt = Date.now();
     try {
-      sent = await whatsapp.sendText(chat, text);
+      // (um instante de "digitando…" antes; o fiscal confere tudo: policy.js)
+      sent = await whatsapp.sendText(chat, text, { typing: 'panel' });
     } catch (error) {
       if (charge && error?.code === 'SEND_TIMEOUT') {
         // O WhatsApp nao respondeu a tempo: a mensagem PODE ter saido. Desfazer
@@ -707,6 +717,228 @@ router.delete('/chats/:id', writeLimiter, async (req, res, next) => {
         (deletedCount === 1 ? ' mensagem).' : ' mensagens).')
     );
     return res.json({ ok: true, unread: await totalUnread() });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// ---------- Respostas do robo (a "base de conhecimento") ----------
+//
+// O administrador ensina o atendimento automatico: "quando a mensagem tiver
+// estas palavras-chave, responda isto" (models/WaAnswer.js). As perguntas que
+// o robo NAO soube responder ficam em wa_unknowns, para virarem respostas.
+
+const MAX_ANSWERS = 100;
+const MAX_KEYWORDS = 20;
+const MAX_VARIANTS = 5;
+const MAX_ANSWER_LENGTH = 900;
+// Sozinhas, estas palavras aparecem em quase toda mensagem: a resposta
+// "roubaria" qualquer conversa.
+// (uma expressao feita SO destas palavras - "o livro", "como faz" - tambem e
+// recusada: ela "sequestraria" pedidos como "quero renovar o livro")
+const TOO_GENERIC = new Set(
+  (
+    'a o e as os um uma uns umas de do da dos das em no na nos nas ao aos para pra pro por pelo pela com sem que se ' +
+    'eu tu ele ela nos vos eles elas voce voces vc vcs me te lhe meu minha meus minhas seu sua seus suas teu tua ' +
+    'esse essa este esta isso isto aquele aquela ai aqui la ja nao sim ok oi ola bom boa dia tarde noite ' +
+    'como qual quais quando quanto onde porque pq quem cade ' +
+    'quero queria pode posso tem tenho ter ser estar e foi vai vou fazer faz fiz preciso precisa gostaria saber sei ' +
+    'livro livros biblioteca obrigado obrigada mais muito pouco tudo nada algo alguem coisa coisas favor'
+  ).split(' ')
+);
+
+function answerDto(answer) {
+  return {
+    _id: answer._id,
+    title: answer.title,
+    keywords: answer.keywords || [],
+    answers: answer.answers || [],
+    enabled: answer.enabled !== false,
+    hits: answer.hits || 0,
+    lastHitAt: answer.lastHitAt || null,
+    updatedByName: answer.updatedByName || '',
+    updatedAt: answer.updatedAt,
+  };
+}
+
+// { title, keywords, answers, enabled } conferidos, ou { error }.
+function cleanAnswer(body) {
+  const title = typeof body?.title === 'string' ? body.title.replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+  if (!title) return { error: 'Dê um nome para a resposta (ex.: Horário de funcionamento).' };
+
+  const rawKeywords = Array.isArray(body?.keywords) ? body.keywords : [];
+  const keywords = [];
+  for (const item of rawKeywords) {
+    if (typeof item !== 'string') continue;
+    const keyword = foldText(item).slice(0, 40).trim();
+    if (!keyword || keywords.includes(keyword)) continue;
+    const words = keyword.split(' ');
+    if (words.length > 1 && words.every((word) => TOO_GENERIC.has(word))) {
+      return {
+        error:
+          'A expressão “' + keyword + '” só tem palavras comuns (apareceria em quase toda conversa). Inclua a palavra do assunto, como “horário” ou “estacionamento”.',
+      };
+    }
+    if (words.length === 1 && (keyword.length < 3 || TOO_GENERIC.has(keyword))) {
+      return {
+        error:
+          'A palavra-chave “' + keyword + '” é comum demais sozinha (apareceria em quase toda conversa). Use uma expressão, como “' + keyword + ' de funcionamento”.',
+      };
+    }
+    keywords.push(keyword);
+  }
+  if (!keywords.length) return { error: 'Informe pelo menos uma palavra-chave.' };
+  if (keywords.length > MAX_KEYWORDS) return { error: 'No máximo ' + MAX_KEYWORDS + ' palavras-chave por resposta.' };
+
+  const rawAnswers = Array.isArray(body?.answers) ? body.answers : [];
+  const answers = [];
+  for (const item of rawAnswers) {
+    if (typeof item !== 'string') continue;
+    const text = item
+      .replace(/\r\n?/g, '\n')
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+      .trim();
+    if (!text) continue;
+    if (text.length > MAX_ANSWER_LENGTH) {
+      return { error: 'Cada resposta pode ter até ' + MAX_ANSWER_LENGTH + ' letras.' };
+    }
+    const { blocks } = contentFindings(text);
+    if (blocks.length) return { error: blocks[0].msg };
+    if (!answers.includes(text)) answers.push(text);
+  }
+  if (!answers.length) return { error: 'Escreva a resposta.' };
+  if (answers.length > MAX_VARIANTS) return { error: 'No máximo ' + MAX_VARIANTS + ' jeitos de responder.' };
+
+  // (so desliga com false de verdade ou o texto "false")
+  const enabled = !(body?.enabled === false || String(body?.enabled).toLowerCase() === 'false');
+  return { title, keywords, answers, enabled };
+}
+
+const UNDERSTOOD_LABELS = {
+  stop: 'Pedido para parar de receber avisos',
+  resume: 'Pedido para voltar a receber avisos',
+  admin: 'Quer falar com um administrador',
+  bot: 'Perguntou se é um robô',
+  extend: 'Quer estender (renovar) um empréstimo',
+  loans: 'Quer ver os empréstimos / a data de devolução',
+  borrow: 'Quer saber como pegar um livro',
+  catalog: 'Quer ver o catálogo',
+  greeting: 'Cumprimento',
+  thanks: 'Agradecimento / despedida',
+  ack: '“Ok” (o robô não responde)',
+};
+
+// GET /api/whatsapp/answers - as respostas cadastradas e as perguntas sem resposta
+router.get('/answers', readLimiter, async (req, res, next) => {
+  try {
+    const [items, unknown] = await Promise.all([
+      WaAnswer.find().sort({ title: 1 }).limit(MAX_ANSWERS).lean(),
+      WaUnknown.find().sort({ count: -1, lastAt: -1 }).limit(40).lean(),
+    ]);
+    return res.json({
+      items: items.map(answerDto),
+      unknown: unknown.map((u) => ({ _id: u._id, text: u.text, count: u.count, lastAt: u.lastAt })),
+      smart: bot.config.smart !== false,
+      limits: { answers: MAX_ANSWERS, keywords: MAX_KEYWORDS, variants: MAX_VARIANTS, length: MAX_ANSWER_LENGTH },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// POST /api/whatsapp/answers/test { text } - o que o robo entenderia (sem enviar nada)
+router.post('/answers/test', writeLimiter, async (req, res, next) => {
+  try {
+    const text = typeof req.body?.text === 'string' ? req.body.text.slice(0, 400) : '';
+    if (!text.trim()) return res.status(400).json({ error: 'Escreva uma mensagem para testar.' });
+    bot.reloadAnswers();
+    const understood = await bot.understand(text);
+    const label =
+      understood.id === 'custom'
+        ? 'Resposta cadastrada: ' + (understood.entry?.title || '')
+        : understood.id
+          ? UNDERSTOOD_LABELS[understood.id] || understood.id
+          : understood.book
+            ? 'Busca no acervo por “' + understood.book + '”'
+            : 'Não entendeu (cairia no menu / “Não entendi”)';
+    return res.json({
+      understood: Boolean(understood.id || understood.book),
+      id: understood.id || (understood.book ? 'book' : ''),
+      label,
+      answer: understood.id === 'custom' ? understood.entry?.answers?.[0] || '' : '',
+      answerId: understood.id === 'custom' ? understood.entry?._id || null : null,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// POST /api/whatsapp/answers { title, keywords: [], answers: [], enabled? }
+router.post('/answers', writeLimiter, async (req, res, next) => {
+  try {
+    const clean = cleanAnswer(req.body);
+    if (clean.error) return res.status(400).json({ error: clean.error });
+    if ((await WaAnswer.countDocuments()) >= MAX_ANSWERS) {
+      return res.status(409).json({ error: 'Limite de ' + MAX_ANSWERS + ' respostas. Apague uma antes de criar outra.' });
+    }
+    const answer = await WaAnswer.create({ ...clean, updatedByName: req.account.fullName });
+    // Dois pedidos ao mesmo tempo podem passar da conta acima: confere depois
+    // de criar e desfaz o que passou do limite (o mais novo).
+    const overflow = await WaAnswer.find().sort({ createdAt: 1, _id: 1 }).skip(MAX_ANSWERS).select('_id').lean();
+    if (overflow.some((item) => String(item._id) === String(answer._id))) {
+      await WaAnswer.deleteOne({ _id: answer._id });
+      return res.status(409).json({ error: 'Limite de ' + MAX_ANSWERS + ' respostas. Apague uma antes de criar outra.' });
+    }
+    bot.reloadAnswers();
+    return res.status(201).json({ answer: answerDto(answer) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+function validId(value) {
+  return typeof value === 'string' && mongoose.isValidObjectId(value);
+}
+
+// PUT /api/whatsapp/answers/:answerId
+router.put('/answers/:answerId', writeLimiter, async (req, res, next) => {
+  try {
+    if (!validId(req.params.answerId)) return res.status(404).json({ error: 'Resposta não encontrada.' });
+    const clean = cleanAnswer(req.body);
+    if (clean.error) return res.status(400).json({ error: clean.error });
+    const answer = await WaAnswer.findOneAndUpdate(
+      { _id: req.params.answerId },
+      { $set: { ...clean, updatedByName: req.account.fullName } },
+      { new: true }
+    ).lean();
+    if (!answer) return res.status(404).json({ error: 'Resposta não encontrada.' });
+    bot.reloadAnswers();
+    return res.json({ answer: answerDto(answer) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// DELETE /api/whatsapp/answers/:answerId
+router.delete('/answers/:answerId', writeLimiter, async (req, res, next) => {
+  try {
+    if (!validId(req.params.answerId)) return res.status(404).json({ error: 'Resposta não encontrada.' });
+    const gone = await WaAnswer.findOneAndDelete({ _id: req.params.answerId }).select('_id').lean();
+    if (!gone) return res.status(404).json({ error: 'Resposta não encontrada.' });
+    bot.reloadAnswers();
+    return res.json({ ok: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// DELETE /api/whatsapp/unknowns/:unknownId - tira uma pergunta da lista
+router.delete('/unknowns/:unknownId', writeLimiter, async (req, res, next) => {
+  try {
+    if (!validId(req.params.unknownId)) return res.status(404).json({ error: 'Pergunta não encontrada.' });
+    await WaUnknown.deleteOne({ _id: req.params.unknownId });
+    return res.json({ ok: true });
   } catch (error) {
     return next(error);
   }

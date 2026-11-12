@@ -1,4 +1,5 @@
 import makeWASocket, {
+  Browsers,
   DisconnectReason,
   fetchLatestBaileysVersion,
   generateMessageIDV2,
@@ -11,10 +12,31 @@ import pino from 'pino';
 import Setting from '../../models/Setting.js';
 import WaAuth from '../../models/WaAuth.js';
 import WaChat from '../../models/WaChat.js';
+import WaContact from '../../models/WaContact.js';
 import WaMessage from '../../models/WaMessage.js';
 import { useMongoAuthState } from './authState.js';
 import { describeMessage } from './content.js';
+import { between, defaultRng, typingPlan } from './humanize.js';
 import { createLease } from './lease.js';
+import {
+  auditOutgoing,
+  backfillContacts,
+  brazilHour,
+  contactOf,
+  limitsFor,
+  noteInbound,
+  noteProactive,
+  noteRestriction,
+  pauseProactive,
+  purposeOf,
+  readHealth,
+  readPolicyConfig,
+  readRestriction,
+  restartWarmup,
+  unengagedRecent,
+  warmupDay,
+  warmupStartAt,
+} from './policy.js';
 import {
   digitsOf,
   lidFromJid,
@@ -128,9 +150,40 @@ export function readConfig(env = process.env) {
     // Conexao recusada (erro) com sessao salva: tenta de novo devagar, para
     // voltar sozinho quando o problema passar.
     slowRetryMs: 10 * 60 * 1000,
+    // Conta recusada (403) varias vezes seguidas: cada nova tentativa espera
+    // o dobro, ate este teto (bater na porta de 10 em 10 minutos numa conta
+    // restrita so chama mais atencao).
+    forbiddenRetryMaxMs: 6 * 60 * 60 * 1000,
+    // PRESENCA: "session" (padrao) = como uma pessoa no WhatsApp Web: fica
+    // "online" quando vai ler/responder e sai sozinha um tempo sorteado
+    // depois da ultima acao. "off" = nunca fica online (so o "digitando…").
+    // Enquanto esta online, o celular da biblioteca nao toca para mensagem
+    // nova (sao segundos); WHATSAPP_PRESENCE=off desfaz.
+    presence: ['off', 'false', '0', 'no', 'nao', 'não'].includes(String(env.WHATSAPP_PRESENCE ?? '').trim().toLowerCase())
+      ? 'off'
+      : 'session',
+    presenceIdleMs: [15 * 1000, 50 * 1000],
+    // Depois de conectar, pergunta ao WhatsApp se a conta esta restrita
+    // para iniciar conversas (uma vez por conexao, sem pressa).
+    restrictionCheckMs: [20 * 1000, 60 * 1000],
+    // Por quanto tempo um "digitando…" da PESSOA vale sem novo sinal.
+    composingTtlMs: 12 * 1000,
+    // Pais informado ao WhatsApp como o do navegador (o Baileys manda "US"
+    // se nada for dito). So vale a partir do proximo vinculo/conexao.
+    countryCode: /^[A-Za-z]{2}$/.test(String(env.WHATSAPP_COUNTRY ?? '').trim())
+      ? String(env.WHATSAPP_COUNTRY).trim().toUpperCase()
+      : '',
     // Teto das mensagens AUTOMATICAS (robo de atendimento, avisos) em 24 h.
     autoDailyLimit:
       Number(env.WHATSAPP_AUTO_DAILY_LIMIT) > 0 ? Number(env.WHATSAPP_AUTO_DAILY_LIMIT) : 500,
+    // Intervalo entre duas mensagens para conversas DIFERENTES (como uma
+    // pessoa trocando de conversa): sorteado nesta faixa a cada vez.
+    switchGapMs: [1800, 5500],
+    // "digitando…" das mensagens do painel (a pessoa ja digitou no painel:
+    // so um instante, para o envio nao ser instantaneo).
+    panelTypingMs: [700, 2200],
+    // As regras do fiscal (policy.js).
+    policy: readPolicyConfig(env),
   };
 }
 
@@ -214,6 +267,28 @@ export class WhatsAppService {
   // eco delas nao parecer mensagem escrita no celular.
   #ownIds = new Map();
   #listeners = new Set();
+  // Uma mensagem de cada vez, como uma pessoa so no aparelho (ver #paced).
+  #outbox = Promise.resolve();
+  #lastOut = null;
+  #wait;
+  #rng;
+  #now;
+  #warmupAt = null;
+  #freshLink = false;
+  // Presenca (ver #goOnline): online agora? e o relogio que tira o "online".
+  #online = false;
+  #idleTimer = null;
+  // Quantos envios estao no "digitando…"/envio agora (ver #stayOnline).
+  #busy = 0;
+  // Conversas cuja presenca ja foi pedida nesta conexao (jid -> quando).
+  #subscribed = new Map();
+  // Quem esta "digitando…" para a biblioteca agora (jid -> quando avisou).
+  #composing = new Map();
+  // A restricao da Meta para iniciar conversas ({ until, type } ou null).
+  #restriction = null;
+  #forbidden = 0;
+  #last463 = 0;
+  #capStatus = '';
 
   constructor(overrides = {}) {
     this.#init(overrides);
@@ -229,6 +304,10 @@ export class WhatsAppService {
     this.#logger =
       overrides.logger || pino({ level: this.#cfg.logLevel }, pino.destination(2));
     this.#version = overrides.version;
+    this.#wait = overrides.wait || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.#rng = overrides.rng || defaultRng;
+    this.#now = overrides.now || (() => Date.now());
+    this.#warmupAt = null;
     this.#state = this.#cfg.enabled ? 'idle' : 'disabled';
   }
 
@@ -270,6 +349,12 @@ export class WhatsAppService {
       broken: this.#broken,
       number: this.#cfg.number,
       notice: this.#notice,
+      // A Meta restringiu o numero para INICIAR conversas ate esta hora
+      // (null = sem restricao conhecida). O painel avisa a equipe.
+      restriction:
+        this.#restriction && new Date(this.#restriction.until).getTime() > Date.now()
+          ? { until: this.#restriction.until, type: this.#restriction.type || '' }
+          : null,
       since: new Date(this.#since).toISOString(),
       downSince: this.#downSince === null ? null : new Date(this.#downSince).toISOString(),
     };
@@ -285,6 +370,18 @@ export class WhatsAppService {
       this.#setState('disabled', 'O WhatsApp está desligado neste servidor.');
       return;
     }
+    // Quem ja escreveu nas conversas do painel vira contato (opt-in): as
+    // conversas anteriores a esta versao nao tinham esse registro.
+    // (o indice unico dos contatos: se nao puder ser criado - registros
+    // repetidos de antes -, avisa no log em vez de falhar calado)
+    WaContact.init().catch((error) =>
+      console.warn('WhatsApp: índice dos contatos não criado (' + error.message + ').')
+    );
+    backfillContacts()
+      .then((added) => {
+        if (added) console.log('WhatsApp: ' + added + ' contato(s) que já escreveram registrados.');
+      })
+      .catch((error) => console.error('WhatsApp: não foi possível registrar os contatos:', error.message));
     try {
       if (await this.#sessionExists()) await this.connect({ auto: true });
     } catch (error) {
@@ -368,7 +465,10 @@ export class WhatsAppService {
     const sock = this.#socketFactory({
       auth: auth.state,
       ...(version ? { version } : {}),
-      browser: ['Biblioteca ADMP', 'Chrome', '1.0.0'],
+      // Um navegador comum (Chrome no Windows), e nao um nome inventado: o
+      // nome so vale no proximo vinculo (QR); a sessao atual nao muda.
+      browser: Browsers.windows('Chrome'),
+      ...(this.#cfg.countryCode ? { countryCode: this.#cfg.countryCode } : {}),
       logger: this.#logger,
       // O celular continua recebendo as notificacoes normais.
       markOnlineOnConnect: false,
@@ -402,6 +502,19 @@ export class WhatsAppService {
     sock.ev.on('messaging-history.set', (event) =>
       this.#enqueueHistory(gen, () => this.#onHistory(sock, event))
     );
+    // Quem esta "digitando…" para a biblioteca (so chega das conversas cuja
+    // presenca foi pedida: ver attend).
+    sock.ev.on('presence.update', (event) => {
+      if (gen === this.#gen) this.#onPresence(event);
+    });
+    // Aviso da Meta: o numero esta perto (ou passou) do limite de conversas
+    // NOVAS do periodo.
+    sock.ev.on('message-capping.update', (payload) => {
+      if (gen !== this.#gen) return;
+      this.#onCapping(payload).catch((error) => {
+        console.error('WhatsApp: erro ao tratar o aviso de limite:', error.message);
+      });
+    });
   }
 
   // O historico que o WhatsApp manda ao vincular pode ter milhares de mensagens:
@@ -435,8 +548,13 @@ export class WhatsAppService {
     if (gen !== this.#gen) return;
     const { connection, qr, lastDisconnect } = update;
 
+    // A Meta restringiu (ou liberou) a conta para iniciar conversas.
+    if (update.reachoutTimeLock) await this.#onRestriction(update.reachoutTimeLock);
+
     if (qr) {
       this.#qr = qr;
+      // Pediu QR: o proximo "aberto" e um vinculo NOVO (aquecimento recomeca).
+      this.#freshLink = true;
       if (this.#state !== 'open') this.#setState('qr');
     }
     if (connection === 'connecting' && this.#state !== 'qr') {
@@ -468,7 +586,33 @@ export class WhatsAppService {
       return;
     }
     this.#attempts = 0;
+    this.#forbidden = 0;
     this.#broken = false;
+    this.#online = false;
+    this.#subscribed.clear();
+    this.#composing.clear();
+    // O que ja se sabia da restricao (para o painel) e, dali a pouco, a
+    // situacao de agora perguntada ao WhatsApp (a resposta chega como
+    // "reachoutTimeLock" em connection.update).
+    readRestriction()
+      .then((value) => {
+        if (sock === this.#sock) this.#restriction = value.active ? { until: value.until, type: value.type } : null;
+      })
+      .catch(() => {});
+    if (typeof sock.fetchAccountReachoutTimelock === 'function') {
+      const timer = setTimeout(() => {
+        if (sock !== this.#sock || this.#state !== 'open') return;
+        sock.fetchAccountReachoutTimelock().catch(() => {});
+      }, Math.round(between(this.#cfg.restrictionCheckMs[0], this.#cfg.restrictionCheckMs[1], this.#rng)));
+      timer.unref?.();
+    }
+    if (this.#freshLink) {
+      // Numero vinculado de novo (depois de um bloqueio, por exemplo): o
+      // aquecimento recomeca do dia 1 a partir de AGORA, e nao do deploy.
+      this.#freshLink = false;
+      this.#warmupAt = new Date(this.#now());
+      restartWarmup(this.#now()).catch(() => {});
+    }
     this.#setState('open');
   }
 
@@ -503,6 +647,8 @@ export class WhatsAppService {
   async #onClose(gen, error) {
     if (gen !== this.#gen) return;
     this.#sock = null;
+    clearTimeout(this.#idleTimer);
+    this.#online = false;
     const code = error?.output?.statusCode;
     const registered = Boolean(this.#auth?.state?.creds?.me);
 
@@ -549,13 +695,22 @@ export class WhatsAppService {
     }
 
     if (code === DisconnectReason.forbidden) {
+      // Conta restringida pela Meta: as mensagens puxadas pelo numero param
+      // por dias e o aquecimento recomeca do dia 1 (policy.js).
+      const cfg = this.#cfg.policy;
+      pauseProactive('o WhatsApp restringiu a conta', cfg.restrictedPauseMs).catch(() => {});
+      restartWarmup(this.#now()).catch(() => {});
+      this.#warmupAt = new Date(this.#now());
       this.#stopHeartbeat();
       await this.#lease.release().catch(() => {});
       this.#setState(
         'error',
         'O WhatsApp recusou a conexão. A conta pode estar restrita; confira o aplicativo no celular. O servidor tenta de novo sozinho.'
       );
-      this.#scheduleRetry(this.#cfg.slowRetryMs);
+      // Cada recusa seguida dobra a espera (10 min, 20, 40... ate 6 h).
+      const retry = Math.min(this.#cfg.forbiddenRetryMaxMs, this.#cfg.slowRetryMs * 2 ** Math.min(this.#forbidden, 10));
+      this.#forbidden += 1;
+      this.#scheduleRetry(Math.round(retry * (0.85 + this.#rng() * 0.3)));
       return;
     }
 
@@ -613,6 +768,10 @@ export class WhatsAppService {
     const sock = this.#sock;
     this.#sock = null;
     this.#qr = null;
+    clearTimeout(this.#idleTimer);
+    this.#online = false;
+    this.#subscribed.clear();
+    this.#composing.clear();
     if (sock) {
       try {
         sock.end(undefined);
@@ -726,12 +885,168 @@ export class WhatsAppService {
     return withTimeout(sock.requestPairingCode(this.#cfg.number), 20 * 1000);
   }
 
+  // ---------- Sinais da propria Meta ----------
+
+  /**
+   * O WhatsApp avisou o estado da restricao para iniciar conversas. Ativa:
+   * as mensagens puxadas pelo numero param (policy.js) e a equipe e avisada
+   * (evento "restricted": o robo manda o aviso ao administrador).
+   */
+  async #onRestriction(state) {
+    try {
+      const result = await noteRestriction(state, this.#cfg.policy, this.#now());
+      this.#restriction = result.active ? { until: result.until, type: result.type } : null;
+      if (!result.isNew) return;
+      this.#warmupAt = new Date(this.#now());
+      console.warn('WhatsApp: a Meta RESTRINGIU este número para iniciar conversas até ' + result.until + '. Avisos automáticos em pausa.');
+      this.#emit({ type: 'restricted', until: result.until, kind: 'reachout' });
+    } catch (error) {
+      console.error('WhatsApp: não foi possível registrar a restrição:', error.message);
+    }
+  }
+
+  /** Aviso de limite de conversas NOVAS (FIRST_WARNING, SECOND_WARNING, CAPPED). */
+  async #onCapping(payload) {
+    const status = String(payload?.capping_status || '').toUpperCase();
+    if (!status || status === 'NONE') {
+      this.#capStatus = '';
+      return;
+    }
+    const capped = status === 'CAPPED';
+    const end = Number(payload?.cycle_end_timestamp) * 1000;
+    const now = this.#now();
+    const ms = capped && Number.isFinite(end) && end > now ? end - now + 24 * 60 * 60 * 1000 : capped ? 72 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+    await pauseProactive(
+      capped
+        ? 'o WhatsApp bloqueou novas conversas neste período (limite atingido)'
+        : 'o WhatsApp avisou que o número está perto do limite de conversas novas',
+      ms,
+      now
+    );
+    if (status !== this.#capStatus) {
+      this.#capStatus = status;
+      console.warn('WhatsApp: aviso de limite de conversas novas (' + status + '). Avisos automáticos em pausa.');
+      this.#emit({ type: 'restricted', until: new Date(now + ms).toISOString(), kind: capped ? 'capped' : 'cap-warning' });
+    }
+  }
+
+  /**
+   * Mensagem recusada com o codigo 463: quase sempre e a conta restrita para
+   * iniciar conversas. Pergunta ao WhatsApp (a resposta cai em #onRestriction);
+   * se nao der para perguntar, pausa um dia por precaucao. Nunca reenvia.
+   */
+  #on463() {
+    const now = this.#now();
+    if (now - this.#last463 < 10 * 60 * 1000) return;
+    this.#last463 = now;
+    const sock = this.#sock;
+    const fallback = () =>
+      pauseProactive('o WhatsApp recusou uma mensagem (463: conta possivelmente restrita)', 24 * 60 * 60 * 1000, now).catch(() => {});
+    if (sock && typeof sock.fetchAccountReachoutTimelock === 'function') {
+      sock.fetchAccountReachoutTimelock().catch(fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  // ---------- Presenca (como uma pessoa no WhatsApp Web) ----------
+
+  /**
+   * Fica "online" (se ainda nao esta) e marca a hora de sair: um tempo
+   * sorteado depois da ULTIMA acao (ler, digitar, enviar). Uma pessoa abre o
+   * WhatsApp, responde e sai; um robo responde "offline" ou fica online 24 h.
+   */
+  async #goOnline(sock) {
+    if (this.#cfg.presence !== 'session' || typeof sock.sendPresenceUpdate !== 'function') return;
+    if (!this.#online) {
+      try {
+        await withTimeout(sock.sendPresenceUpdate('available'), 5000);
+        if (sock !== this.#sock) return;
+        this.#online = true;
+      } catch {
+        return; // so um sinal
+      }
+    }
+    this.#stayOnline(sock);
+  }
+
+  #stayOnline(sock) {
+    if (!this.#online) return;
+    clearTimeout(this.#idleTimer);
+    const [min, max] = this.#cfg.presenceIdleMs;
+    this.#idleTimer = setTimeout(() => {
+      if (sock !== this.#sock || !this.#online) return;
+      // Digitando ou enviando agora: ninguem sai do WhatsApp no meio de uma
+      // frase. Espera de novo (o fim do envio tambem renova).
+      if (this.#busy > 0) {
+        this.#stayOnline(sock);
+        return;
+      }
+      this.#online = false;
+      Promise.resolve()
+        .then(() => sock.sendPresenceUpdate('unavailable'))
+        .catch(() => {});
+    }, Math.round(between(min, max, this.#rng)));
+    this.#idleTimer.unref?.();
+  }
+
+  // Pede a presenca da conversa (o que o WhatsApp Web faz ao abri-la): sem
+  // isso o "digitando…" nao aparece para a pessoa nem o dela chega aqui.
+  async #subscribe(sock, jid) {
+    if (!jid || typeof sock.presenceSubscribe !== 'function') return;
+    const last = this.#subscribed.get(jid);
+    if (last && Date.now() - last < 10 * 60 * 1000) return;
+    if (this.#subscribed.size > 2000) this.#subscribed.clear();
+    this.#subscribed.set(jid, Date.now());
+    await withTimeout(sock.presenceSubscribe(jid), 5000).catch(() => {});
+  }
+
+  #onPresence({ id, presences } = {}) {
+    const now = Date.now();
+    for (const [participant, presence] of Object.entries(presences || {})) {
+      const typing = presence?.lastKnownPresence === 'composing' || presence?.lastKnownPresence === 'recording';
+      for (const jid of new Set([id, participant])) {
+        if (!jid) continue;
+        if (typing) this.#composing.set(jid, now);
+        else this.#composing.delete(jid);
+      }
+    }
+    if (this.#composing.size > 2000) this.#composing.clear();
+  }
+
+  /**
+   * "Abre a conversa": fica online e pede a presenca dela. O robo chama
+   * antes de ler uma mensagem. So um sinal: se falhar, nada muda.
+   */
+  async attend(chat) {
+    const sock = this.#sock;
+    if (this.#state !== 'open' || !sock) return false;
+    try {
+      await this.#goOnline(sock);
+      await this.#subscribe(sock, chat?.jid || chat?.lid || '');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** A pessoa desta conversa esta "digitando…" (ou gravando audio) agora? */
+  isComposing(chat) {
+    const now = Date.now();
+    return [chat?.jid, chat?.lid].some((jid) => {
+      const at = jid ? this.#composing.get(jid) : null;
+      return Boolean(at && now - at < this.#cfg.composingTtlMs);
+    });
+  }
+
   // ---------- Avisos para quem usa o servico (robo de atendimento) ----------
 
   /**
    * fn({ type, chat, message, text, kind }) para cada mensagem NOVA ao vivo:
    * - "incoming": a pessoa escreveu;
-   * - "phone-out": a biblioteca escreveu pelo CELULAR (nao pelo painel/robo).
+   * - "phone-out": a biblioteca escreveu pelo CELULAR (nao pelo painel/robo);
+   * - "restricted" ({ until, kind }): a Meta restringiu o numero para iniciar
+   *   conversas (ou avisou do limite de conversas novas).
    * Devolve a funcao que cancela.
    */
   onEvent(fn) {
@@ -821,6 +1136,11 @@ export class WhatsAppService {
     if (!key?.id || !key.remoteJid) return;
     // So conversas com uma pessoa: grupos, status e canais ficam de fora.
     if (!isPnUser(key.remoteJid) && !isLidUser(key.remoteJid)) return;
+    // Mandou: nao esta mais "digitando…" (o WhatsApp nao avisa o fim).
+    if (!key.fromMe && !history) {
+      this.#composing.delete(key.remoteJid);
+      if (key.remoteJidAlt) this.#composing.delete(key.remoteJidAlt);
+    }
 
     const identity = await this.#identity(sock, key);
     if (!identity) return;
@@ -866,6 +1186,13 @@ export class WhatsAppService {
     // o proprio servidor escolheu.)
     if (Number.isFinite(info.expiration) && !(fromMe && this.#ownIds.has(key.id))) {
       await noteEphemeral(chat._id, info.expiration, at).catch(() => {});
+    }
+    // A pessoa escreveu para o numero: vira contato (opt-in, policy.js). Dura
+    // mais que a conversa (que some com as mensagens temporarias).
+    if (!fromMe && inserted) {
+      await noteInbound({ phone: chat.phone || identity.phone, lid: chat.lid || identity.lid, at: new Date(at), live: !history }).catch(
+        (error) => console.error('WhatsApp: não foi possível guardar o contato:', error.message)
+      );
     }
 
     // So o que e novo e ao vivo vai para o atendimento automatico. O eco das
@@ -924,6 +1251,7 @@ export class WhatsAppService {
           (errorCode ? ' (código ' + errorCode + ')' : '') +
           '.'
       );
+      if (errorCode === '463') this.#on463();
     }
     const apply = async () => {
       const found = await WaMessage.findOne({ waId, fromMe: true }).select('chat').lean();
@@ -1086,34 +1414,226 @@ export class WhatsAppService {
    * auto: "bot" | "overdue" | "handoff" para mensagens do proprio sistema
    * (contam no teto das automaticas, nao no do painel).
    */
-  async sendText(chat, text, { auto = '' } = {}) {
-    await this.assertCanSend({ auto });
-    const sock = this.#requireOpen();
-    const jid = await this.#targetJid(sock, chat);
-    // O id e escolhido aqui (e lembrado ANTES de enviar): o eco da mensagem
-    // chega antes de o envio terminar.
-    const messageId = generateMessageIDV2(sock.user?.id);
-    this.#rememberOwn(messageId);
-    let sent;
+  // ---------- O fiscal (policy.js) ----------
+
+  async #limits() {
+    if (!this.#warmupAt) this.#warmupAt = await warmupStartAt(this.#cfg.policy, this.#now());
+    return limitsFor(this.#cfg.policy, warmupDay(this.#warmupAt, this.#now()));
+  }
+
+  /** Os tetos do dia (aquecimento) e a pausa, para o painel e o README. */
+  async policyStatus() {
+    const [limits, health] = await Promise.all([this.#limits(), readHealth()]);
+    return { limits, health, warmupStartedAt: this.#warmupAt?.toISOString?.() || null };
+  }
+
+  /**
+   * Junta o que o fiscal precisa e pergunta se a mensagem pode sair.
+   * Lanca POLICY_BLOCKED (429) com as regras quando nao pode.
+   */
+  async audit(chat, text, { auto = '' } = {}) {
+    const purpose = purposeOf(auto);
+    const now = this.#now();
+    const dayAgo = new Date(now - 24 * 60 * 60 * 1000);
+    const hourAgo = new Date(now - 60 * 60 * 1000);
+    const [contact, recent, lastHour, autoToday, proactiveToday, limits, health, unengaged, chatToday, deletedHour, restriction] = await Promise.all([
+      contactOf(chat),
+      WaMessage.find({ fromMe: true, at: { $gte: dayAgo } })
+        .sort({ at: -1 })
+        .limit(400)
+        .select('chat text auto')
+        .lean(),
+      WaMessage.countDocuments({
+        fromMe: true,
+        at: { $gte: hourAgo },
+        $or: [{ sentBy: { $ne: null } }, { auto: { $nin: ['', null] } }],
+      }),
+      this.autoSentToday(),
+      WaContact.countDocuments({ lastProactiveAt: { $gte: dayAgo } }),
+      this.#limits(),
+      readHealth(),
+      purpose === 'proactive' ? unengagedRecent(now) : 0,
+      // (para contato frio pelo painel: quantas ja foram para esta pessoa)
+      purpose === 'panel'
+        ? WaMessage.countDocuments({ chat: chat._id, fromMe: true, at: { $gte: dayAgo } })
+        : 0,
+      // Envios da ultima hora de conversas APAGADAS (senao apagar liberaria o teto).
+      Promise.all([this.#deletedSends('panel', hourAgo), this.#deletedSends('auto', hourAgo)]).then(
+        ([a, b]) => a + b
+      ),
+      // A restricao da Meta para iniciar conversas (so pesa no que o numero puxa).
+      purpose === 'proactive' || purpose === 'panel' ? readRestriction() : {},
+    ]);
+    const verdict = auditOutgoing(
+      {
+        text,
+        chatId: String(chat._id),
+        purpose,
+        contact,
+        recent: recent.map((m) => ({ chatId: String(m.chat), text: m.text, purpose: purposeOf(m.auto) })),
+        counts: {
+          lastHour: lastHour + deletedHour,
+          autoToday,
+          proactiveToday,
+          unengaged,
+          // (o maior: as gravadas na conversa ou as anotadas no contato, que
+          // valem mesmo com a conversa apagada)
+          chatToday: Math.max(chatToday, contact.proactiveDay || 0),
+        },
+        limits,
+        health,
+        restriction,
+        hour: brazilHour(new Date(now)),
+        now,
+      },
+      this.#cfg.policy
+    );
+    verdict.purpose = purpose;
+    verdict.contact = contact;
+    // (o menu repetido nas respostas do robo e esperado: nao vai para o log)
+    const warns = verdict.warns.filter((w) => !(purpose === 'reply' && w.rule === 'NEAR_DUPLICATE'));
+    if (warns.length) {
+      console.warn('WhatsApp: alerta do fiscal (' + purpose + '): ' + warns.map((w) => w.rule).join(', '));
+    }
+    if (!verdict.ok) {
+      const error = new WhatsAppError('POLICY_BLOCKED', verdict.blocks[0].msg, 429);
+      error.rules = verdict.blocks.map((b) => b.rule);
+      throw error;
+    }
+    return verdict;
+  }
+
+  /**
+   * Uma mensagem de cada vez (como UMA pessoa no aparelho): trocar de
+   * conversa leva alguns segundos sorteados. bypass: a mensagem do painel
+   * (alguem ja esperou digitando) nao entra na fila, mas conta como a ultima.
+   */
+  #paced(chatId, task, { bypass = false } = {}) {
+    const key = String(chatId);
+    const go = async () => {
+      if (!bypass && this.#lastOut && this.#lastOut.chat !== key) {
+        const gap = between(this.#cfg.switchGapMs[0], this.#cfg.switchGapMs[1], this.#rng);
+        const wait = this.#lastOut.at + gap - this.#now();
+        if (wait > 0) await this.#wait(wait);
+      }
+      try {
+        return await task();
+      } finally {
+        this.#lastOut = { chat: key, at: this.#now() };
+      }
+    };
+    if (bypass) return go();
+    const run = this.#outbox.then(go, go);
+    this.#outbox = run.catch(() => {});
+    return run;
+  }
+
+  /**
+   * "digitando…" antes de enviar, em trechos (texto longo para no meio). So
+   * um sinal: falhou, segue. mode: "reply" | "proactive" | "panel".
+   */
+  async #typeOut(sock, jid, text, mode, online) {
+    if (!mode || typeof sock.sendPresenceUpdate !== 'function') return;
+    const plan =
+      mode === 'panel'
+        ? [{ typeMs: Math.round(between(this.#cfg.panelTypingMs[0], this.#cfg.panelTypingMs[1], this.#rng)), pauseMs: 0 }]
+        : typingPlan(text, { proactive: mode === 'proactive', rng: this.#rng });
     try {
-      sent = await withTimeout(
-        sock.sendMessage(jid, { text }, { messageId, ephemeralExpiration: this.ephemeralFor(chat) }),
-        this.#cfg.sendTimeoutMs,
-        'SEND_TIMEOUT',
-        'O WhatsApp não confirmou o envio a tempo. Confira na conversa se a mensagem saiu.'
-      );
-    } catch (error) {
-      if (error instanceof WhatsAppError) throw error;
-      throw new WhatsAppError(
-        'SEND_FAILED',
-        'Não foi possível enviar a mensagem pelo WhatsApp agora.',
-        502
-      );
+      // Quem digita esta online (presenca "session"); no modo antigo, so
+      // se pedido (WHATSAPP_BOT_TYPING=online).
+      if (this.#cfg.presence === 'session') await this.#goOnline(sock);
+      else if (online) await withTimeout(sock.sendPresenceUpdate('available'), 5000);
+      await this.#subscribe(sock, jid);
+      for (const step of plan) {
+        // (o relogio de "sair do online" recomeca a cada trecho: um aviso
+        // longo digita por mais tempo que o ocioso minimo)
+        if (this.#cfg.presence === 'session') this.#stayOnline(sock);
+        await withTimeout(sock.sendPresenceUpdate('composing', jid), 5000);
+        await this.#wait(step.typeMs);
+        if (step.pauseMs) {
+          await withTimeout(sock.sendPresenceUpdate('paused', jid), 5000);
+          await this.#wait(step.pauseMs);
+        }
+      }
+    } catch {
+      /* so um sinal */
     }
-    if (!sent?.key?.id) {
-      throw new WhatsAppError('SEND_FAILED', 'O WhatsApp não confirmou o envio.', 502);
+  }
+
+  /**
+   * Envia o texto e devolve o id da mensagem no WhatsApp.
+   * auto: "bot" | "overdue" | "handoff" | "request" para mensagens do proprio
+   * sistema (contam no teto das automaticas, nao no do painel).
+   * typing: "reply" | "proactive" | "panel" mostra o "digitando…" antes
+   * (tempo proporcional ao texto, com variacao); online: fica "online"
+   * durante (WHATSAPP_BOT_TYPING=online).
+   * guard: async () => boolean, conferido quando chega a vez na fila e de
+   * novo depois do "digitando…" (o robo desiste se um administrador assumiu
+   * a conversa nesse meio tempo): false = SUPERSEDED, nada sai.
+   * Toda mensagem passa pelo fiscal (audit) antes.
+   */
+  async sendText(chat, text, { auto = '', typing = null, online = false, guard = null } = {}) {
+    await this.assertCanSend({ auto });
+    const verdict = await this.audit(chat, text, { auto });
+    const jid = await this.#targetJid(this.#requireOpen(), chat);
+    const superseded = () =>
+      new WhatsAppError('SUPERSEDED', 'A conversa mudou antes do envio (um administrador assumiu).', 409);
+    const result = await this.#paced(
+      chat._id,
+      async () => {
+        if (guard && !(await guard())) throw superseded();
+        // O socket da VEZ (a conexao pode ter voltado enquanto esperava a fila).
+        let sock = this.#requireOpen();
+        this.#busy += 1;
+        try {
+          await this.#typeOut(sock, jid, text, typing, online);
+        } finally {
+          this.#busy -= 1;
+        }
+        // (o relogio recomeca agora: cobre a conferencia e o envio, que levam
+        // so um instante; depois do envio ele recomeca de novo)
+        if (this.#cfg.presence === 'session') this.#stayOnline(sock);
+        if (guard && !(await guard())) throw superseded();
+        // A conexao pode ter caido (e voltado) durante o "digitando…": envia
+        // pelo socket aberto AGORA (o endereco continua valendo).
+        sock = this.#requireOpen();
+        // O id e escolhido aqui (e lembrado ANTES de enviar): o eco da
+        // mensagem chega antes de o envio terminar.
+        const messageId = generateMessageIDV2(sock.user?.id);
+        this.#rememberOwn(messageId);
+        let sent;
+        try {
+          sent = await withTimeout(
+            sock.sendMessage(jid, { text }, { messageId, ephemeralExpiration: this.ephemeralFor(chat) }),
+            this.#cfg.sendTimeoutMs,
+            'SEND_TIMEOUT',
+            'O WhatsApp não confirmou o envio a tempo. Confira na conversa se a mensagem saiu.'
+          );
+        } catch (error) {
+          if (error instanceof WhatsAppError) throw error;
+          throw new WhatsAppError(
+            'SEND_FAILED',
+            'Não foi possível enviar a mensagem pelo WhatsApp agora.',
+            502
+          );
+        } finally {
+          // Presenca "session": continua online mais um pouco e sai sozinha.
+          if (this.#cfg.presence === 'session') this.#stayOnline(sock);
+          else if (online) sock.sendPresenceUpdate?.('unavailable')?.catch?.(() => {});
+        }
+        if (!sent?.key?.id) {
+          throw new WhatsAppError('SEND_FAILED', 'O WhatsApp não confirmou o envio.', 502);
+        }
+        return { waId: sent.key.id, at: toMs(sent.messageTimestamp), jid };
+      },
+      { bypass: verdict.purpose === 'panel' }
+    );
+    // Mensagem puxada pelo numero (aviso, ou o painel escrevendo a quem nunca
+    // escreveu): conta no teto de "primeiras mensagens" e na saude.
+    if (verdict.purpose === 'proactive' || (verdict.purpose === 'panel' && !verdict.contact?.inbound)) {
+      await noteProactive({ phone: chat.phone, lid: chat.lid, at: new Date(result.at) }).catch(() => {});
     }
-    return { waId: sent.key.id, at: toMs(sent.messageTimestamp), jid };
+    return result;
   }
 
   /**
@@ -1151,10 +1671,11 @@ export class WhatsAppService {
 
   /** Avisa o WhatsApp que as mensagens foram lidas (como o WhatsApp Web faz). */
   async sendReadReceipts(chat, waIds) {
-    if (this.#state !== 'open' || !this.#sock || !chat.jid || !waIds.length) return;
+    const jid = chat?.jid || chat?.lid || '';
+    if (this.#state !== 'open' || !this.#sock || !jid || !waIds.length) return;
     try {
       await this.#sock.readMessages(
-        waIds.map((id) => ({ remoteJid: chat.jid, id, fromMe: false }))
+        waIds.map((id) => ({ remoteJid: jid, id, fromMe: false }))
       );
     } catch {
       /* so um aviso a pessoa: a leitura no painel ja valeu */

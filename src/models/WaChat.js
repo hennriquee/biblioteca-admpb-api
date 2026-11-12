@@ -69,6 +69,17 @@ const waChatSchema = new mongoose.Schema(
     botDayCount: { type: Number, default: 0 },
     // Estourou o freio: o robo fica mudo nesta conversa ate esta hora.
     botMutedUntil: { type: Date, default: null },
+    // "Nao entendi" seguidos: no segundo, o robo oferece um administrador em
+    // vez de repetir o menu (zera quando entende alguma coisa).
+    botMisses: { type: Number, default: 0 },
+    // A ultima vez que o robo respondeu a um "obrigado": o proximo
+    // "obrigado"/"ok" em seguida fica sem resposta (ninguem agradece em laco).
+    botClosedAt: { type: Date, default: null },
+    // A ultima mensagem de texto recebida (normalizada) e quando: a MESMA de
+    // novo fica sem resposta (resposta automatica de empresa em laco).
+    botLastIn: { type: String, default: '' },
+    botLastInAt: { type: Date, default: null },
+    botLastInCount: { type: Number, default: 0 },
 
     // MENSAGENS TEMPORARIAS: o temporizador desta conversa no WhatsApp, em
     // segundos (0 = desligado; null = ainda nao se sabe), aprendido das
