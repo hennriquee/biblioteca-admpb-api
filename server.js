@@ -17,13 +17,24 @@ import devRoutes from "./src/routes/dev.js";
 import notificationRoutes from "./src/routes/notifications.js";
 import captchaRoutes from "./src/routes/captcha.js";
 import whatsappRoutes from "./src/routes/whatsapp.js";
+import mongoose from "mongoose";
 import { whatsapp } from "./src/services/whatsapp/service.js";
-import { bot as whatsappBot } from "./src/services/whatsapp/bot.js";
+// ATENDIMENTO AUTOMATICO (robo do menu): DESLIGADO em 12/11/2026. O WhatsApp
+// da biblioteca so e usado de dentro do painel (Conversas); a unica mensagem
+// automatica e o aviso de 1 dia de atraso (overdue.js, abaixo). O arquivo do
+// robo esta todo comentado.
+// import { bot as whatsappBot } from "./src/services/whatsapp/bot.js";
 import { createOverdueReminders } from "./src/services/whatsapp/overdue.js";
 import { createRetention } from "./src/services/whatsapp/retention.js";
+import { createInboxWatch } from "./src/services/whatsapp/inboxWatch.js";
 
-// Aviso automatico de atraso pelo WhatsApp (services/whatsapp/overdue.js).
-const overdueReminders = createOverdueReminders({ whatsapp, bot: whatsappBot });
+// Aviso automatico de atraso pelo WhatsApp (services/whatsapp/overdue.js):
+// UM por emprestimo, 1 dia depois do prazo, e nada mais.
+// (antes: createOverdueReminders({ whatsapp, bot: whatsappBot }))
+const overdueReminders = createOverdueReminders({ whatsapp });
+// Mensagem recebida: anota o link de solicitacao e manda a notificacao do
+// app aos administradores que escolheram "Mensagens" (nao responde nada).
+const inboxWatch = createInboxWatch({ whatsapp });
 // Mensagens temporarias: o painel apaga as mensagens com mais de 7 dias, como
 // o WhatsApp da biblioteca (services/whatsapp/retention.js).
 const whatsappRetention = createRetention({ whatsapp });
@@ -319,6 +330,82 @@ function warnAboutDevLogin() {
   }
 }
 
+// Campos do robo nas conversas (models/WaChat.js, comentados la).
+const BOT_CHAT_FIELDS = [
+  "mode",
+  "humanUntil",
+  "handoffAt",
+  "handoffReason",
+  "requestDayAt",
+  "requestDayCount",
+  "lastRequestKey",
+  "lastRequestAt",
+  "botStep",
+  "botData",
+  "botAt",
+  "botWindowAt",
+  "botWindowCount",
+  "botDayAt",
+  "botDayCount",
+  "botMutedUntil",
+  "botMisses",
+  "botClosedAt",
+  "botLastIn",
+  "botLastInAt",
+  "botLastInCount",
+];
+
+/**
+ * Tira do banco o que era so do robo do WhatsApp. Devolve quantas coisas
+ * saíram (colecoes apagadas + conversas e solicitacoes limpas).
+ */
+async function removeBotData() {
+  const db = mongoose.connection.db;
+  let removed = 0;
+  // Respostas cadastradas e perguntas sem resposta (colecoes inteiras).
+  const existing = new Set(
+    (await db.listCollections({}, { nameOnly: true }).toArray()).map((c) => c.name),
+  );
+  // (outra copia do servidor subindo junto, no deploy, pode ter apagado
+  // primeiro: "nao existe" aqui e sucesso, nao erro)
+  const gone = (error) =>
+    ["NamespaceNotFound", "IndexNotFound"].includes(error?.codeName) || [26, 27].includes(error?.code);
+  for (const name of ["wa_answers", "wa_unknowns"]) {
+    if (!existing.has(name)) continue;
+    try {
+      await db.dropCollection(name);
+      console.log("Robô do WhatsApp: coleção " + name + " apagada.");
+      removed += 1;
+    } catch (error) {
+      if (!gone(error)) throw error;
+    }
+  }
+  // O estado do menu/atendimento em cada conversa.
+  if (existing.has("wa_chats")) {
+    const chats = db.collection("wa_chats");
+    const unset = Object.fromEntries(BOT_CHAT_FIELDS.map((field) => [field, ""]));
+    const result = await chats.updateMany(
+      { $or: BOT_CHAT_FIELDS.map((field) => ({ [field]: { $exists: true } })) },
+      { $unset: unset },
+    );
+    removed += result.modifiedCount || 0;
+    const indexes = await chats.indexes().catch(() => []);
+    if (indexes.some((index) => index.name === "handoffAt_1")) {
+      await chats.dropIndex("handoffAt_1").catch((error) => {
+        if (!gone(error)) throw error;
+      });
+    }
+  }
+  // "Quando o administrador foi avisado pelo WhatsApp" das solicitacoes.
+  const LoanRequest = mongoose.model("LoanRequest");
+  const requests = await LoanRequest.collection.updateMany(
+    { waNotifiedAt: { $exists: true } },
+    { $unset: { waNotifiedAt: "" } },
+  );
+  removed += requests.modifiedCount || 0;
+  return removed;
+}
+
 /**
  * Preparos de banco ao iniciar. Cada um no seu try: a MUDANCA DE CASA DAS
  * CONTAS nao pode ficar de fora porque um acerto de ordenacao falhou antes
@@ -398,6 +485,17 @@ async function prepareDatabase() {
       },
     },
     {
+      // O ROBO DO WHATSAPP SAI DO BANCO (desligado em 12/11/2026): as
+      // respostas cadastradas, as perguntas sem resposta e o estado do menu
+      // em cada conversa. Nao mexe nas conversas nem nas mensagens. Roda a
+      // cada inicio, mas so faz algo enquanto houver o que tirar.
+      what: "a retirada do robô do WhatsApp do banco",
+      async run() {
+        const removed = await removeBotData();
+        if (removed) console.log("Robô do WhatsApp: " + removed + " retirado(s) do banco.");
+      },
+    },
+    {
       what: "o número da pessoa nos empréstimos",
       async run() {
         const loansNumbered = await backfillLoanPersonCodes();
@@ -437,7 +535,8 @@ function shutDown(signal) {
     httpServer.closeIdleConnections?.();
     return undefined;
   });
-  whatsappBot.stop();
+  // whatsappBot.stop(); // (robo desligado)
+  inboxWatch.stop();
   overdueReminders.stop();
   whatsappRetention.stop();
   Promise.race([drained, wait(8000)])
@@ -458,9 +557,9 @@ connectDatabase()
       // Reconecta o WhatsApp da biblioteca se ja houver sessao salva. Roda em
       // segundo plano: nao segura a subida do servidor.
       whatsapp.start();
-      // Atendimento automatico (menu) e aviso de atraso: so agem com o
-      // WhatsApp conectado neste servidor.
-      whatsappBot.start();
+      // Aviso de atraso: so age com o WhatsApp conectado neste servidor.
+      // (O atendimento automatico - whatsappBot.start() - foi desligado.)
+      inboxWatch.start();
       overdueReminders.start();
       whatsappRetention.start();
     });

@@ -62,6 +62,17 @@ const personSchema = new mongoose.Schema(
     // sugestao mais nova que estava na tela dele). As mais novas que isso
     // contam na bolinha vermelha. null = nunca abriu a tela: todas contam.
     suggestionsSeenAt: { type: Date, default: null },
+
+    // NOTIFICACOES DO APP (Configurações > Notificações, so administrador): o
+    // que ESTE administrador escolheu receber nos aparelhos em que ativou as
+    // notificacoes (models/AdminDevice.js, services/adminPush.js). Nada vem
+    // marcado: cada um escolhe.
+    notify: {
+      requests: { type: Boolean, default: false },
+      loans: { type: Boolean, default: false },
+      suggestions: { type: Boolean, default: false },
+      messages: { type: Boolean, default: false },
+    },
   },
   { timestamps: true }
 );

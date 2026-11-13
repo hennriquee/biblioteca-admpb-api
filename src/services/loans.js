@@ -8,6 +8,7 @@ import Book, { normalizeText } from "../models/Book.js";
 import Person from "../models/Person.js";
 import { conflict, overbooked } from "./occupancy.js";
 import { syncActiveLoans } from "./people.js";
+import { notifyNewLoan } from "./adminPush.js";
 
 function badRequest(message) {
   const error = new Error(message);
@@ -131,6 +132,10 @@ export async function recordLoan({
     person.phone = personPhone;
     await syncActiveLoans(person);
   }
+
+  // Notificacao do app para os OUTROS administradores que escolheram "Novos
+  // empréstimos" (services/adminPush.js). Em segundo plano.
+  notifyNewLoan(loan, { exceptPerson: account._id });
 
   return loan;
 }

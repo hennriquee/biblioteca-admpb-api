@@ -1,41 +1,45 @@
 import Loan from '../../models/Loan.js';
-import WaChat from '../../models/WaChat.js';
+// import WaChat from '../../models/WaChat.js'; // (so o passo do robo usava: ver o fim de run)
 import { addDays, brDate, dayOf, todayInBrazil } from '../brDates.js';
-import { resolveChat } from './store.js';
+import { resolveChat, saveMessage } from './store.js';
 import { digitsOf } from './phone.js';
 import WaMessage from '../../models/WaMessage.js';
 import { between, defaultRng, leastSimilar, pick } from './humanize.js';
 import { brazilHour, computeHealth, contactOf, readPolicyConfig, templateOf } from './policy.js';
 
 /**
- * AVISO AUTOMATICO DE ATRASO pelo WhatsApp da biblioteca.
+ * A UNICA MENSAGEM AUTOMATICA do WhatsApp da biblioteca (desde 12/11/2026).
  *
- * Passou 1 dia da data de devolucao (o livro esta atrasado), a pessoa recebe
- * UMA mensagem por prazo vencido: se o prazo for estendido e vencer de novo,
- * sai outro aviso (para o prazo novo); nunca dois para o mesmo prazo. O
- * registro fica no emprestimo (overdueAutoFor = o prazo avisado).
+ * Passou 1 dia da data de devolucao (o livro esta atrasado): a pessoa recebe
+ * UMA mensagem dizendo para procurar um dos membros da biblioteca para
+ * devolver - e, daquele emprestimo, nunca mais nada sai sozinho (nem se o
+ * prazo for estendido e vencer de novo). O registro fica no emprestimo
+ * (overdueAutoAt = quando o aviso saiu). Todo o resto do WhatsApp e pelo
+ * painel (Conversas), por um administrador.
  *
- * Cuidados com o numero da biblioteca (envio em massa e o que faz o WhatsApp
- * bloquear):
- * - so atrasos RECENTES (ate MAX_LATE_DAYS): ao publicar, os atrasos antigos
+ * A mensagem NAO oferece opcoes ("1 - falar com administrador", "0 - menu",
+ * "responda parar"): nao existe mais robo para responder a elas. Se a pessoa
+ * responder, a resposta aparece em Conversas.
+ *
+ * Cuidados com o numero da biblioteca (envio automatico e o que faz o
+ * WhatsApp bloquear), mantidos:
+ * - so atrasos RECENTES (ate maxLateDays): ao publicar, os atrasos antigos
  *   nao recebem uma rajada de mensagens;
  * - so em horario comercial de Brasilia, poucos por rodada e com intervalo;
- * - nao avisa se um administrador ja cobrou depois do vencimento, nem no meio
- *   de um atendimento humano.
- * Nao mexe na "cobranca" manual (uma a cada 30 dias, services/charges.js).
- *
- * Contra o bloqueio do numero pela Meta (ver policy.js e humanize.js):
- * - so para quem JA ESCREVEU para o numero (contato com opt-in); quem nunca
- *   escreveu fica para a cobranca manual do painel. WHATSAPP_OVERDUE_COLD=true
- *   desfaz isso (nao recomendado);
+ * - nao avisa se um administrador ja cobrou depois do vencimento;
+ * - so para quem JA ESCREVEU para o numero (contato com opt-in, policy.js);
+ *   quem nunca escreveu fica para a cobranca manual do painel.
+ *   WHATSAPP_OVERDUE_COLD=true desfaz isso (nao recomendado);
+ * - quem pediu "parar" ao antigo robo continua sem receber;
  * - texto com variacao, escolhido para NAO parecer com os avisos do dia;
- * - "digitando…" proporcional, poucos por rodada, intervalos sorteados de 1 a
- *   4 minutos e rodadas a cada 10 a 25 minutos (nada de relogio exato);
- * - pausa sozinho com sinais de denuncia (mensagens recusadas, avisos que
- *   ninguem le) e quando a conta e restringida.
+ * - pausa sozinho com sinais de denuncia e quando a conta e restringida.
+ * Nao mexe na "cobranca" manual (uma a cada 30 dias, services/charges.js).
  */
 
 const FALSY = new Set(['false', '0', 'no', 'off', 'nao', 'não']);
+
+// Quem aparece como remetente no painel.
+const SENDER_NAME = 'Aviso automático';
 
 export function readOverdueConfig(env = process.env) {
   return {
@@ -57,8 +61,7 @@ function firstName(name) {
   return String(name || '').trim().split(/\s+/)[0] || '';
 }
 
-// As partes do aviso, cada uma com formas equivalentes (o sentido e as
-// opcoes 1 e 0 nunca mudam; ver o passo "blocked" em bot.js).
+// As partes do aviso, cada uma com formas equivalentes (o sentido nunca muda).
 const OPENINGS = [
   'Olá{name}. Aqui é da Biblioteca ADMP Brasil.',
   'Oi{name}, tudo bem? Aqui é da Biblioteca ADMP Brasil.',
@@ -73,39 +76,37 @@ const BODIES = [
   'Vimos aqui que o prazo do livro {title} terminou em {date}.',
   'A data de devolução do livro {title} ({date}) já passou.',
 ];
+// O pedido: procurar um dos membros da biblioteca para devolver.
 const ASKS = [
-  'Pedimos que faça a devolução o quanto antes.',
-  'Você consegue devolvê-lo assim que possível?',
-  'Quando puder, por favor, faça a devolução.',
-  'Se puder devolver nos próximos dias, agradecemos muito.',
-  'Assim que possível, traga o livro de volta, por favor.',
+  'Por favor, procure um dos membros da biblioteca para fazer a devolução.',
+  'Pedimos que procure um dos membros da equipe da biblioteca para devolvê-lo.',
+  'Quando puder, procure um dos membros da biblioteca para fazer a devolução.',
+  'Para devolver, é só procurar um dos membros da biblioteca.',
+  'Assim que possível, procure um dos membros da biblioteca para devolver o livro.',
 ];
-const EXTRAS = [
-  '',
-  '',
-  'Outras pessoas também querem ler. 📚',
-  'Se precisar de mais tempo, é só falar com a gente.',
-  'Muito obrigado! 🙏',
-];
-const OPTION_INTROS = ['', '', 'Se quiser, responda:', 'Pode responder por aqui:'];
-const OPTION_ADMIN = ['1️⃣ Falar com um administrador', '1️⃣ Falar com um administrador da biblioteca'];
-const OPTION_MENU = ['0️⃣ Ver o menu de atendimento', '0️⃣ Ver as outras opções do atendimento'];
-// A SAIDA: quem nao quer receber avisos tem como dizer (e o robo obedece:
-// bot.js, "stop"). Sem isso, a unica saida da pessoa e bloquear ou denunciar
-// o numero - e e isso que a Meta conta. Vai sempre no PRIMEIRO aviso que a
-// pessoa recebe e, depois, de vez em quando.
-const OPT_OUT_HINTS = [
-  'Se preferir não receber avisos por aqui, é só responder *parar*.',
-  'Não quer receber estes avisos pelo WhatsApp? Responda *parar*.',
-  'Para não receber mais avisos por este número, responda *parar*.',
-];
+const EXTRAS = ['', '', 'Muito obrigado! 🙏', 'Obrigado pela compreensão.', 'Outras pessoas também querem ler. 📚'];
 
-/**
- * O aviso de atraso, com variacao (rng escolhe as formas).
- * optOutHint: true = leva a linha de como parar de receber; false = nao
- * leva; sem dizer = uma vez a cada tres.
- */
-export function overdueText(loan, rng = defaultRng, { optOutHint } = {}) {
+// ---- Do aviso antigo (com o robo), desligado em 12/11/2026 ----
+// O aviso oferecia opcoes que o robo respondia e a saida "responda parar".
+// Sem robo, ninguem responderia a elas.
+// const ASKS_OLD = [
+//   'Pedimos que faça a devolução o quanto antes.',
+//   'Você consegue devolvê-lo assim que possível?',
+//   'Quando puder, por favor, faça a devolução.',
+//   'Se puder devolver nos próximos dias, agradecemos muito.',
+//   'Assim que possível, traga o livro de volta, por favor.',
+// ];
+// const OPTION_INTROS = ['', '', 'Se quiser, responda:', 'Pode responder por aqui:'];
+// const OPTION_ADMIN = ['1️⃣ Falar com um administrador', '1️⃣ Falar com um administrador da biblioteca'];
+// const OPTION_MENU = ['0️⃣ Ver o menu de atendimento', '0️⃣ Ver as outras opções do atendimento'];
+// const OPT_OUT_HINTS = [
+//   'Se preferir não receber avisos por aqui, é só responder *parar*.',
+//   'Não quer receber estes avisos pelo WhatsApp? Responda *parar*.',
+//   'Para não receber mais avisos por este número, responda *parar*.',
+// ];
+
+/** O aviso de atraso, com variacao (rng escolhe as formas). */
+export function overdueText(loan, rng = defaultRng) {
   const name = firstName(loan.personName);
   const title = '*' + String(loan.bookTitle || '').replace(/[*_~`]/g, '').trim() + '*';
   const fill = (text) =>
@@ -114,22 +115,15 @@ export function overdueText(loan, rng = defaultRng, { optOutHint } = {}) {
       .replace('{title}', title)
       .replace('{date}', brDate(dayOf(loan.dueDate)));
   const extra = pick(EXTRAS, rng);
-  const intro = pick(OPTION_INTROS, rng);
-  const body =
+  return (
     fill(pick(OPENINGS, rng)) +
     '\n\n' +
     fill(pick(BODIES, rng)) +
     ' ' +
     pick(ASKS, rng) +
-    (extra ? ' ' + extra : '') +
-    '\n\n' +
-    (intro ? intro + '\n' : '') +
-    pick(OPTION_ADMIN, rng) +
-    '\n' +
-    pick(OPTION_MENU, rng);
-  // (sorteado DEPOIS do resto: o texto de antes desta linha nao muda)
-  const hint = optOutHint === undefined ? rng() > 2 / 3 : optOutHint;
-  return hint ? body + '\n\n' + pick(OPT_OUT_HINTS, rng) : body;
+    (extra ? ' ' + extra : '')
+  );
+  // (antes: + as opcoes 1/0 do robo e, as vezes, a linha do "responda parar")
 }
 
 // Envio que nao chegou a sair (pode tentar de novo depois).
@@ -147,7 +141,6 @@ const RETRY_LATER = new Set([
 
 export function createOverdueReminders({
   whatsapp,
-  bot,
   config: overrides = {},
   now = () => Date.now(),
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -169,10 +162,9 @@ export function createOverdueReminders({
     return rows.map((row) => row.text).filter(Boolean);
   }
   let timer = null;
-  let first = null;
   let running = false;
   // Atrasos de quem nunca escreveu ja contados no log (um aviso no log por
-  // prazo, e nao a cada rodada).
+  // emprestimo, e nao a cada rodada).
   const coldSeen = new Set();
 
   async function candidates() {
@@ -181,6 +173,9 @@ export function createOverdueReminders({
     const loans = await Loan.find({
       status: 'ativo',
       personPhone: { $nin: ['', null] },
+      // UM aviso por emprestimo: quem ja recebeu (por qualquer prazo) nao
+      // recebe mais nada.
+      overdueAutoAt: null,
       dueDate: { $gte: new Date(oldest + 'T00:00:00Z'), $lt: new Date(today + 'T23:59:59Z') },
     })
       .sort({ dueDate: 1 })
@@ -188,10 +183,13 @@ export function createOverdueReminders({
       .lean();
     return loans.filter((loan) => {
       const due = dayOf(loan.dueDate);
+      // Venceu ONTEM ou antes: 1 dia de atraso.
       if (!due || !(today > due)) return false;
       if (due < addDays(today, -cfg.maxLateDays)) return false;
-      const done = loan.overdueAutoFor && new Date(loan.overdueAutoFor).getTime() === new Date(loan.dueDate).getTime();
-      return !done;
+      // (antes: um aviso por PRAZO - estendido e vencido de novo, saia outro)
+      // const done = loan.overdueAutoFor && new Date(loan.overdueAutoFor).getTime() === new Date(loan.dueDate).getTime();
+      // return !done;
+      return true;
     });
   }
 
@@ -200,6 +198,27 @@ export function createOverdueReminders({
       { _id: loan._id, overdueAutoFor: loan.dueDate },
       { $set: { overdueAutoFor: loan.overdueAutoFor ?? null, overdueAutoAt: loan.overdueAutoAt ?? null } }
     );
+  }
+
+  // Envia e grava no painel (Conversas mostra "Aviso automático").
+  async function send(chat, text) {
+    const sent = await whatsapp.sendText(chat, text, { auto: 'overdue', typing: 'proactive' });
+    try {
+      await saveMessage(chat, {
+        waId: sent.waId,
+        fromMe: true,
+        kind: 'text',
+        text,
+        at: sent.at,
+        status: 2,
+        auto: 'overdue',
+        sentByName: SENDER_NAME,
+      });
+    } catch (error) {
+      // Ja saiu: o eco do WhatsApp grava a mensagem de qualquer jeito.
+      console.error('WhatsApp: aviso de atraso enviado, mas não gravado agora:', error.message);
+    }
+    return sent;
   }
 
   /** Uma rodada. Devolve quantos avisos sairam. */
@@ -220,31 +239,25 @@ export function createOverdueReminders({
         if (sent >= cfg.perRun || !whatsapp.isOpen()) break;
         if (!digitsOf(loan.personPhone)) continue;
 
-        // Um administrador ja cobrou depois do vencimento: nao repete.
+        // Um administrador ja cobrou depois do vencimento: nao repete (e
+        // marca o emprestimo como avisado: nada mais sai dele).
         const alreadyCharged =
           loan.overdueSentAt && new Date(loan.overdueSentAt) >= new Date(loan.dueDate);
 
         const chat = alreadyCharged ? null : await resolveChat({ phone: loan.personPhone });
         if (!alreadyCharged && !chat) continue;
-        if (
-          chat?.mode === 'human' &&
-          chat.humanUntil &&
-          new Date(chat.humanUntil).getTime() > now()
-        ) {
-          continue; // em atendimento: tenta na proxima rodada
-        }
-        // Robo silenciado pelo freio: o aviso ofereceria "1 – administrador"
-        // numa conversa em que o robo nao responde. Tenta depois.
-        if (chat?.botMutedUntil && new Date(chat.botMutedUntil).getTime() > now()) continue;
+        // ---- Do robo, desligado em 12/11/2026 (os campos sairam do banco) ----
+        // if (chat?.mode === 'human' && chat.humanUntil && new Date(chat.humanUntil).getTime() > now()) continue;
+        // if (chat?.botMutedUntil && new Date(chat.botMutedUntil).getTime() > now()) continue;
 
         // Lista fria: quem nunca escreveu para o numero nao recebe aviso
         // automatico (e o que mais leva a Meta a bloquear). Fica sem marcar:
         // se a pessoa escrever, o aviso sai numa rodada seguinte.
         const contact = chat ? await contactOf(chat) : { inbound: false };
-        // Pediu para parar de receber avisos: nunca mais (ate pedir de volta).
+        // Pediu para parar de receber avisos (ao antigo robo): nunca mais.
         if (chat && contact.optOut) continue;
         if (chat && !policy.allowCold && !contact.inbound) {
-          const key = String(loan._id) + '|' + new Date(loan.dueDate).getTime();
+          const key = String(loan._id);
           if (!coldSeen.has(key)) {
             coldSeen.add(key);
             cold += 1;
@@ -258,7 +271,7 @@ export function createOverdueReminders({
             _id: loan._id,
             status: 'ativo',
             dueDate: loan.dueDate,
-            overdueAutoFor: loan.overdueAutoFor ?? null,
+            overdueAutoAt: null,
           },
           { $set: { overdueAutoFor: loan.dueDate, overdueAutoAt: new Date(now()) } },
           { new: true }
@@ -269,38 +282,14 @@ export function createOverdueReminders({
           if (sent > 0) await wait(span(cfg.gapMs));
           // Entre varias formas, a menos parecida com os avisos do dia.
           // (compara o MOLDE, como o fiscal: nome, livro e data nao contam)
-          // (o PRIMEIRO aviso que a pessoa recebe sempre diz como parar)
-          const optOutHint = contact.proactiveTotal ? undefined : true;
-          const { text } = leastSimilar((r) => overdueText(loan, r, { optOutHint }), recent, { rng, key: templateOf });
-          // (entre o sorteio e o envio passam minutos: se um administrador
-          // assumiu a conversa ou o robo foi silenciado, nao sai - tenta depois)
-          const guard = typeof bot.stillMine === 'function' ? () => bot.stillMine(chat._id, { strict: true }) : null;
-          await bot.sendAutomatic(chat, text, 'overdue', { typing: 'proactive', guard });
+          const { text } = leastSimilar((r) => overdueText(loan, r), recent, { rng, key: templateOf });
+          await send(chat, text);
           recent.push(text);
-          // A resposta da pessoa ("1" ou "0") ja cai no atendimento automatico.
-          // Vale por 3 dias (a pessoa costuma responder um aviso bem depois). Um
-          // atendimento humano JA VENCIDO volta ao robo aqui; senao o "1" da
-          // pessoa cairia na saudacao e se perderia.
-          await WaChat.updateOne(
-            {
-              _id: chat._id,
-              $or: [
-                { mode: 'bot' },
-                { humanUntil: null },
-                { humanUntil: { $lte: new Date(now()) } },
-              ],
-            },
-            {
-              $set: {
-                mode: 'bot',
-                humanUntil: null,
-                handoffAt: null,
-                botStep: 'blocked',
-                botData: { ttlMs: 3 * 24 * 60 * 60 * 1000 },
-                botAt: new Date(now()),
-              },
-            }
-          );
+          // ---- Do robo, desligado em 12/11/2026 ----
+          // Antes, a conversa ia para o passo "blocked" do robo, para a resposta
+          // "1"/"0" da pessoa cair no atendimento automatico. Agora nada mais
+          // sai: a resposta, se vier, fica em Conversas para um administrador.
+          // await WaChat.updateOne({ _id: chat._id, ... }, { $set: { mode: 'bot', botStep: 'blocked', ... } });
           sent += 1;
         } catch (error) {
           if (RETRY_LATER.has(error?.code)) {
@@ -309,7 +298,7 @@ export function createOverdueReminders({
             break;
           }
           // Sem WhatsApp, sem endereco, ou envio sem resposta a tempo (pode ter
-          // saido): fica marcado, sem nova tentativa para este prazo.
+          // saido): fica marcado, sem nova tentativa.
           console.warn('WhatsApp: aviso de atraso não enviado (' + (error?.code || error?.message) + ').');
         }
       }
@@ -344,7 +333,6 @@ export function createOverdueReminders({
       next(span(cfg.firstRunMs));
     },
     stop() {
-      clearTimeout(first);
       clearTimeout(timer);
       timer = null;
     },

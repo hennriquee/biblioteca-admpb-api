@@ -34,7 +34,8 @@ const loanSchema = new mongoose.Schema(
     },
     overdueSentByName: { type: String, default: '' },
     // AVISO AUTOMATICO de atraso pelo WhatsApp (services/whatsapp/overdue.js):
-    // para qual prazo ja foi mandado (um aviso por prazo vencido) e quando.
+    // para qual prazo foi mandado e quando. Desde 12/11/2026 e UM aviso por
+    // emprestimo: com overdueAutoAt preenchido, nada mais sai sozinho dele.
     overdueAutoFor: { type: Date, default: null },
     overdueAutoAt: { type: Date, default: null },
 

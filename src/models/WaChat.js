@@ -40,46 +40,31 @@ const waChatSchema = new mongoose.Schema(
     unread: { type: Number, default: 0 },
     readAt: { type: Date, default: null },
 
-    // ATENDIMENTO (services/whatsapp/bot.js). "bot": o atendimento automatico
-    // responde; "human": um administrador esta conversando e o robo fica quieto
-    // ate humanUntil (ou ate alguem devolver a conversa ao robo no painel).
-    // handoffAt: quando a pessoa pediu para falar com um administrador (vazio
-    // depois que alguem responde ou devolve ao robo).
-    mode: { type: String, enum: ['bot', 'human'], default: 'bot' },
-    humanUntil: { type: Date, default: null },
-    handoffAt: { type: Date, default: null, index: true },
-    // Por que esta esperando: "admin" (pediu um administrador no menu) ou
-    // "request" (mandou um pedido de emprestimo do acervo publico).
-    handoffReason: { type: String, default: '' },
-    // Avisos de pedido de emprestimo mandados ao administrador por esta
-    // conversa nas ultimas 24 h (freio contra enxurrada) e o ultimo pedido
-    // sem link (para a mesma mensagem repetida nao avisar duas vezes).
-    requestDayAt: { type: Date, default: null },
-    requestDayCount: { type: Number, default: 0 },
-    lastRequestKey: { type: String, default: '' },
-    lastRequestAt: { type: Date, default: null },
-    // Onde a pessoa esta no menu do robo (step + dados do passo) e ate quando.
-    botStep: { type: String, default: '' },
-    botData: { type: mongoose.Schema.Types.Mixed, default: null },
-    botAt: { type: Date, default: null },
-    // Freio contra conversa sem fim com outro robo: respostas na janela atual.
-    botWindowAt: { type: Date, default: null },
-    botWindowCount: { type: Number, default: 0 },
-    botDayAt: { type: Date, default: null },
-    botDayCount: { type: Number, default: 0 },
-    // Estourou o freio: o robo fica mudo nesta conversa ate esta hora.
-    botMutedUntil: { type: Date, default: null },
-    // "Nao entendi" seguidos: no segundo, o robo oferece um administrador em
-    // vez de repetir o menu (zera quando entende alguma coisa).
-    botMisses: { type: Number, default: 0 },
-    // A ultima vez que o robo respondeu a um "obrigado": o proximo
-    // "obrigado"/"ok" em seguida fica sem resposta (ninguem agradece em laco).
-    botClosedAt: { type: Date, default: null },
-    // A ultima mensagem de texto recebida (normalizada) e quando: a MESMA de
-    // novo fica sem resposta (resposta automatica de empresa em laco).
-    botLastIn: { type: String, default: '' },
-    botLastInAt: { type: Date, default: null },
-    botLastInCount: { type: Number, default: 0 },
+    // ---- ATENDIMENTO AUTOMATICO (robo), DESLIGADO em 12/11/2026 ----
+    // Os campos abaixo eram do robo (services/whatsapp/bot.js, comentado) e
+    // SAIRAM DO BANCO: o servidor os apaga ao iniciar (ver "o robô do
+    // WhatsApp" em prepareDatabase, server.js). Ficam aqui so como registro.
+    // mode: { type: String, enum: ['bot', 'human'], default: 'bot' },
+    // humanUntil: { type: Date, default: null },
+    // handoffAt: { type: Date, default: null, index: true },
+    // handoffReason: { type: String, default: '' },
+    // requestDayAt: { type: Date, default: null },
+    // requestDayCount: { type: Number, default: 0 },
+    // lastRequestKey: { type: String, default: '' },
+    // lastRequestAt: { type: Date, default: null },
+    // botStep: { type: String, default: '' },
+    // botData: { type: mongoose.Schema.Types.Mixed, default: null },
+    // botAt: { type: Date, default: null },
+    // botWindowAt: { type: Date, default: null },
+    // botWindowCount: { type: Number, default: 0 },
+    // botDayAt: { type: Date, default: null },
+    // botDayCount: { type: Number, default: 0 },
+    // botMutedUntil: { type: Date, default: null },
+    // botMisses: { type: Number, default: 0 },
+    // botClosedAt: { type: Date, default: null },
+    // botLastIn: { type: String, default: '' },
+    // botLastInAt: { type: Date, default: null },
+    // botLastInCount: { type: Number, default: 0 },
 
     // MENSAGENS TEMPORARIAS: o temporizador desta conversa no WhatsApp, em
     // segundos (0 = desligado; null = ainda nao se sabe), aprendido das

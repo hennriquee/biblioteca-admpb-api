@@ -30,7 +30,11 @@ import {
 import { announceAvailability } from "../services/returnAlerts.js";
 import { preparePreview, previewFor } from "../services/requestPreview.js";
 import { networkOf } from "./suggestions.js";
-import { requestChannel } from "../services/whatsapp/bot.js";
+// (o atendimento automatico de services/whatsapp/bot.js esta desligado: o
+// canal do "Combinar" mora agora em requestLink.js, sem robo)
+// import { requestChannel } from "../services/whatsapp/bot.js";
+import { requestChannel } from "../services/whatsapp/requestLink.js";
+import { notifyNewRequest } from "../services/adminPush.js";
 
 /**
  * SOLICITACOES DE EMPRESTIMO (ver models/LoanRequest.js).
@@ -381,7 +385,7 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
     ) {
       const personId = readPersonRef(body.personRef);
       chosen = personId
-        ? await Person.findById(personId).select("fullName").lean()
+        ? await Person.findById(personId).select("fullName username").lean()
         : null;
       if (!chosen) {
         return res.status(409).json({
@@ -443,6 +447,9 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
     // fica gravado na solicitacao, para o painel.
     const shownName = chosen ? shortName(name) : name;
     const linkExpiresAt = new Date(Date.now() + LINK_DAYS * DAY_MS);
+    // (Toda solicitacao nova notifica - mesmo quando o nome tocado e de alguem
+    // da equipe: a busca publica mostra esses nomes a qualquer pessoa, e uma
+    // excecao por nome deixaria qualquer um calar o aviso.)
 
     // A mesma pessoa pedindo o mesmo livro de novo (voltou e confirmou outra
     // vez, trocou o dia): o link e o mesmo, so o dia muda.
@@ -460,17 +467,29 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
           requesterName: name,
           requesterPerson: chosen ? chosen._id : null,
           requesterIsNew,
-          // Mudou o dia: a nova mensagem avisa o administrador de novo.
-          waNotifiedAt: null,
+          // (do robo, desligado: "mudou o dia, a nova mensagem avisa o
+          // administrador de novo" pelo WhatsApp)
+          // waNotifiedAt: null,
         },
       },
-      { new: true },
+      // (o documento de ANTES: para saber se o dia mudou)
+      { new: false },
     );
-    // Para qual WhatsApp a tela manda a mensagem (o do robo ou, de reserva,
-    // o brasileiro: ver requestChannel em services/whatsapp/bot.js).
+    // Para qual WhatsApp a tela manda a mensagem (o conectado ao painel ou,
+    // de reserva, o brasileiro: ver requestChannel em requestLink.js).
     const channel = requestChannel();
     if (again) {
       preparePreview(book._id);
+      // Trocou o dia: os administradores recebem a notificacao de novo (a
+      // nova troca a antiga no aparelho). O mesmo pedido repetido, nao.
+      if (again.pickupDate?.getTime() !== day.date.getTime()) {
+        notifyNewRequest({
+          ...again.toObject(),
+          pickupDate: day.date,
+          requesterName: name,
+          requesterIsNew,
+        });
+      }
       return res.json({
         token: again.token,
         pickupDate: day.text,
@@ -507,6 +526,11 @@ publicRequests.post("/", burstLimiter, passLimiter, async (req, res, next) => {
     // A capa da previa do link fica pronta em segundo plano (ver
     // services/requestPreview.js): a resposta nao espera por ela.
     preparePreview(book._id);
+
+    // Notificacao do app para os administradores que escolheram "Novas
+    // solicitações" (services/adminPush.js), com o botao "Registrar
+    // solicitação". Em segundo plano: a resposta nao espera.
+    notifyNewRequest(request.toObject());
 
     return res
       .status(201)
@@ -931,6 +955,30 @@ router.post("/:id/loan", async (req, res, next) => {
     await LoanRequest.deleteOne({ _id: claimed._id });
 
     return res.status(201).json(await withAdminFlag(loan.toObject()));
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// DELETE /api/requests/pending/:id -> descarta um pedido NOVO do acervo
+// (pendente: o link ainda nao foi usado). Pelo sininho, quando o pedido nao
+// vai ser atendido (repetido, engano). Nao segura exemplar, entao nada volta
+// para a estante; o link para de valer.
+router.delete("/pending/:id", async (req, res, next) => {
+  try {
+    const removed = await LoanRequest.findOneAndDelete({
+      _id: req.params.id,
+      status: "pendente",
+    })
+      .select("_id")
+      .lean();
+    if (!removed) {
+      return res.status(404).json({
+        error:
+          "Esse pedido não está mais aberto: já foi registrado, descartado ou o link venceu.",
+      });
+    }
+    return res.json({ ok: true });
   } catch (error) {
     return next(error);
   }

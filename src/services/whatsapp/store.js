@@ -25,17 +25,17 @@ async function mergeChats(from, into) {
   // (A "ultima mensagem" e recalculada no fim, por refreshLastMessage: assim a
   // previa segue as mesmas regras - apagada, assinatura do painel.)
   const set = {};
-  // Atendimento humano em curso na conversa que some passa para a que fica
-  // (senao o "Aguardando administrador" sumiria e o robo responderia no meio).
-  const fromUntil = from.humanUntil ? new Date(from.humanUntil).getTime() : 0;
-  const intoUntil = into.humanUntil ? new Date(into.humanUntil).getTime() : 0;
-  if (from.mode === 'human' && fromUntil > Date.now() && fromUntil > intoUntil) {
-    set.mode = 'human';
-    set.humanUntil = from.humanUntil;
-    if (from.handoffAt) set.handoffAt = from.handoffAt;
-  } else if (from.handoffAt && into.mode === 'human' && !into.handoffAt) {
-    set.handoffAt = from.handoffAt;
-  }
+  // ---- Do robo, desligado em 12/11/2026 (os campos sairam do banco) ----
+  // Atendimento humano em curso na conversa que some passava para a que fica.
+  // const fromUntil = from.humanUntil ? new Date(from.humanUntil).getTime() : 0;
+  // const intoUntil = into.humanUntil ? new Date(into.humanUntil).getTime() : 0;
+  // if (from.mode === 'human' && fromUntil > Date.now() && fromUntil > intoUntil) {
+  //   set.mode = 'human';
+  //   set.humanUntil = from.humanUntil;
+  //   if (from.handoffAt) set.handoffAt = from.handoffAt;
+  // } else if (from.handoffAt && into.mode === 'human' && !into.handoffAt) {
+  //   set.handoffAt = from.handoffAt;
+  // }
   await WaChat.updateOne(
     { _id: into._id },
     { ...(Object.keys(set).length ? { $set: set } : {}), $inc: { unread: from.unread || 0 } }

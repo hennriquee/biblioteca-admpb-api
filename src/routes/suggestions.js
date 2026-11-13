@@ -7,6 +7,7 @@ import SuggestionThrottle from "../models/SuggestionThrottle.js";
 import SuggestionQuota from "../models/SuggestionQuota.js";
 import { normalizeText } from "../models/Book.js";
 import { requireAdmin } from "../middleware/auth.js";
+import { notifyNewSuggestion } from "../services/adminPush.js";
 import {
   SUGGESTION_PHOTO,
   assertValidImage,
@@ -329,6 +330,9 @@ publicSuggestions.post("/", burstLimiter, async (req, res, next) => {
       await releaseAll(reserved);
       return res.json({ ok: true, duplicate: true });
     }
+    // Notificacao do app para quem escolheu "Livros sugeridos"
+    // (services/adminPush.js). Em segundo plano.
+    notifyNewSuggestion({ title, author });
     return res.status(201).json({ ok: true });
   } catch (error) {
     // A foto subiu mas a sugestao nao foi gravada: nao deixa a foto orfa.
