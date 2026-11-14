@@ -8,7 +8,13 @@ import { between, defaultRng, leastSimilar, pick } from './humanize.js';
 import { brazilHour, computeHealth, contactOf, readPolicyConfig, templateOf } from './policy.js';
 
 /**
- * A UNICA MENSAGEM AUTOMATICA do WhatsApp da biblioteca (desde 12/11/2026).
+ * DESLIGADO EM 13/11/2026 - este arquivo nao e mais usado (server.js nao o
+ * importa) e, mesmo que fosse, o servico do WhatsApp recusa todo envio que
+ * nao venha do painel. O WhatsApp da biblioteca nao manda NENHUMA mensagem
+ * sozinho; a cobranca de atraso e um administrador escrevendo em Conversas.
+ * Fica aqui so como historico.
+ *
+ * (Como era:) A UNICA MENSAGEM AUTOMATICA do WhatsApp da biblioteca (desde 12/11/2026).
  *
  * Passou 1 dia da data de devolucao (o livro esta atrasado): a pessoa recebe
  * UMA mensagem dizendo para procurar um dos membros da biblioteca para

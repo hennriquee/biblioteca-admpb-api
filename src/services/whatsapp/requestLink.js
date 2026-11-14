@@ -34,7 +34,9 @@ const RECONNECT_GRACE_MS = 15 * 60 * 1000;
 // - conectando/reconectando COM sessao salva e fora do ar ha pouco tempo
 //   (servidor acordando, queda rapida). Sem sessao, conectando e o QR.
 function receivingSoon(status, now) {
-  if (status.state === 'open' || status.state === 'standby') return true;
+  // (sleeping: conexao sob demanda fechada de proposito, com a sessao salva -
+  // o WhatsApp guarda a mensagem e entrega quando o painel abrir)
+  if (status.state === 'open' || status.state === 'standby' || status.state === 'sleeping') return true;
   if (status.state !== 'connecting' && status.state !== 'reconnecting') return false;
   if (!status.hasSession) return false;
   const down = status.downSince ? Date.parse(status.downSince) : NaN;

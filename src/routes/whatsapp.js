@@ -19,6 +19,14 @@ import { shortName } from '../services/people.js';
 import { WhatsAppError, whatsapp } from '../services/whatsapp/service.js';
 // import { bot, REQUEST_LINK } from '../services/whatsapp/bot.js'; // (robo desligado)
 import { REQUEST_LINK } from '../services/whatsapp/requestLink.js';
+import {
+  assertFloorFree,
+  endFloor,
+  FloorError,
+  floorStatus,
+  lockSendTurn,
+  noteActivity,
+} from '../services/whatsapp/floor.js';
 import { refreshLastMessage, resolveChat, saveMessage } from '../services/whatsapp/store.js';
 import {
   canonicalPhone,
@@ -50,6 +58,12 @@ router.use(requireAdmin);
 
 router.use((req, res, next) => {
   res.set('Cache-Control', 'no-store');
+  // CONEXAO SOB DEMANDA (service.js): um administrador usando as Conversas
+  // mantem o WhatsApp conectado (e o acorda, se estava dormindo). A consulta
+  // de status SEM ?active=1 e a bolinha de nao lidas das outras telas: essa
+  // nao conta como "usando".
+  const background = req.method === 'GET' && req.path === '/status' && req.query.active !== '1';
+  if (!background) whatsapp.touch();
   next();
 });
 
@@ -243,6 +257,11 @@ async function oneChatDto(chat) {
 }
 
 function sendError(res, error) {
+  // Uma conversa por vez (floor.js): outra conversa esta em andamento ou
+  // acabou ha pouco. A tela mostra quem e ate quando.
+  if (error instanceof FloorError) {
+    return res.status(409).json({ error: error.message, code: error.code, floor: error.floor });
+  }
   if (error instanceof WhatsAppError) {
     return res.status(error.status).json({
       error: error.message,
@@ -273,6 +292,9 @@ router.get('/status', readLimiter, async (req, res, next) => {
     return res.json({
       ...whatsapp.snapshot(),
       unread: await totalUnread(),
+      // Uma conversa por vez (floor.js): com quem a biblioteca esta falando
+      // agora, ou ate quando espera para a proxima (null = livre).
+      floor: await floorStatus().catch(() => null),
       // Aquecimento e pausa do fiscal (policy.js): tetos do dia.
       protection: await whatsapp.policyStatus().catch(() => null),
     });
@@ -514,6 +536,8 @@ function checkAmbiguousCharge({ chatId, loanId, text, startedAt, charge, account
 router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
   let charge = null;
   let loanId = null;
+  // Uma conversa por vez (floor.js): a fila de envios, solta no fim (finally).
+  let unlock = null;
   try {
     const raw = typeof req.body?.text === 'string' ? req.body.text : '';
     const typed = raw
@@ -539,6 +563,12 @@ router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
     // Antes de mexer na cobranca: da para enviar agora?
     await whatsapp.assertCanSend();
 
+    // UMA CONVERSA POR VEZ: um envio de cada vez; outra conversa em
+    // andamento (ou que acabou ha pouco) recusa aqui, antes de registrar
+    // cobranca ou enviar. A vez so e anotada depois que a mensagem sai.
+    unlock = await lockSendTurn();
+    await assertFloorFree({ chatId: chat._id });
+
     if (req.body?.chargeLoanId) {
       loanId = String(req.body.chargeLoanId);
       if (!mongoose.isValidObjectId(loanId)) {
@@ -548,9 +578,7 @@ router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
       if (!loan) return res.status(404).json({ error: 'Empréstimo não encontrado.' });
       // A cobranca de um emprestimo so vale na conversa da pessoa dele.
       if (!samePhone(loan.personPhone, chat.phone)) {
-        return res
-          .status(409)
-          .json({ error: 'Essa cobrança é de outra pessoa. Abra a conversa dela.' });
+        return res.status(409).json({ error: 'Essa cobrança é de outra pessoa. Abra a conversa dela.' });
       }
       charge = await registerCharge(loanId, req.account);
       if (!charge.ok) return res.status(charge.status).json(charge.body);
@@ -574,8 +602,18 @@ router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
         });
         charge = null;
       }
+      // Sem resposta a tempo, a mensagem PODE ter saido: conta como conversa
+      // em andamento (nao arrisca duas pessoas ao mesmo tempo).
+      if (error?.code === 'SEND_TIMEOUT') {
+        await noteActivity({ chatId: chat._id, byName: req.account.fullName, force: true }).catch(() => {});
+      }
       throw error;
     }
+
+    // Saiu: esta e a conversa em andamento a partir de agora.
+    await noteActivity({ chatId: chat._id, byName: req.account.fullName, force: true }).catch((error) => {
+      console.error('WhatsApp: não foi possível anotar a conversa em andamento:', error.message);
+    });
 
     // A mensagem JA saiu. Se o banco falhar agora, nao devolve erro (a pessoa
     // reenviaria): o proprio evento do WhatsApp grava a mensagem.
@@ -628,6 +666,24 @@ router.post('/chats/:id/messages', sendLimiter, async (req, res, next) => {
     });
   } catch (error) {
     return sendError(res, error) || next(error);
+  } finally {
+    unlock?.();
+  }
+});
+
+// POST /api/whatsapp/floor/end { chatId? } - "Encerrar conversa": a conversa
+// em andamento termina agora e o intervalo ate a proxima comeca a contar
+// (floor.js). chatId: so encerra se a vez ainda for dessa conversa.
+router.post('/floor/end', writeLimiter, async (req, res, next) => {
+  try {
+    const chatId = req.body?.chatId ? String(req.body.chatId) : null;
+    if (chatId && !mongoose.isValidObjectId(chatId)) {
+      return res.status(404).json({ error: 'Conversa não encontrada.' });
+    }
+    await endFloor({ chatId });
+    return res.json({ floor: await floorStatus() });
+  } catch (error) {
+    return next(error);
   }
 });
 
@@ -713,6 +769,8 @@ router.delete('/chats/:id', writeLimiter, async (req, res, next) => {
     // Os envios de hoje continuam contando nos tetos diarios (protecao do numero).
     await whatsapp.keepSendCounts(chat._id);
     const { deletedCount = 0 } = await WaMessage.deleteMany({ chat: chat._id });
+    // Era a conversa em andamento (uma por vez): ela acabou.
+    await endFloor({ chatId: chat._id }).catch(() => {});
     console.warn(
       'WhatsApp: conversa apagada do painel por ' +
         req.account.fullName +

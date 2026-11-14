@@ -1,6 +1,7 @@
 import Person from '../../models/Person.js';
 import { notifyNewMessage } from '../adminPush.js';
 import { previewOf } from './content.js';
+import { noteActivity } from './floor.js';
 import { phoneVariants } from './phone.js';
 import { noteRequestLink } from './requestLink.js';
 
@@ -13,7 +14,10 @@ import { noteRequestLink } from './requestLink.js';
  *   (requestLink.js);
  * - avisa, pela notificacao do app, os administradores que escolheram
  *   "Mensagens no WhatsApp" (services/adminPush.js). Quem responde e um
- *   administrador, pelo painel (Conversas).
+ *   administrador, pelo painel (Conversas);
+ * - UMA CONVERSA POR VEZ (floor.js): a pessoa respondendo mantem a conversa
+ *   dela em andamento; mensagem escrita pelo CELULAR da biblioteca passa a
+ *   vez para aquela conversa (o celular e o mesmo numero).
  */
 export function createInboxWatch({ whatsapp }) {
   let stop = null;
@@ -44,7 +48,20 @@ export function createInboxWatch({ whatsapp }) {
     start() {
       if (stop) return;
       stop = whatsapp.onEvent((event) => {
+        if (event?.type === 'phone-out' && event.chat?._id) {
+          return noteActivity({
+            chatId: event.chat._id,
+            at: event.message?.at,
+            byName: 'Celular da biblioteca',
+            force: true,
+          }).catch((error) => {
+            console.error('WhatsApp: não foi possível anotar a conversa do celular:', error.message);
+          });
+        }
         if (event?.type !== 'incoming') return undefined;
+        if (event.chat?._id) {
+          noteActivity({ chatId: event.chat._id, at: event.message?.at }).catch(() => {});
+        }
         return onIncoming(event).catch((error) => {
           console.error('WhatsApp: falha ao tratar uma mensagem recebida:', error.message);
         });

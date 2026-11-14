@@ -19,19 +19,18 @@ import captchaRoutes from "./src/routes/captcha.js";
 import whatsappRoutes from "./src/routes/whatsapp.js";
 import mongoose from "mongoose";
 import { whatsapp } from "./src/services/whatsapp/service.js";
-// ATENDIMENTO AUTOMATICO (robo do menu): DESLIGADO em 12/11/2026. O WhatsApp
-// da biblioteca so e usado de dentro do painel (Conversas); a unica mensagem
-// automatica e o aviso de 1 dia de atraso (overdue.js, abaixo). O arquivo do
-// robo esta todo comentado.
+// NENHUMA MENSAGEM AUTOMATICA (desde 13/11/2026): o WhatsApp da biblioteca so
+// envia o que um administrador digita no painel (Conversas). O robo do menu
+// saiu em 12/11/2026 (bot.js, todo comentado) e o aviso automatico de atraso
+// saiu em 13/11/2026 (overdue.js, sem uso). O proprio servico recusa qualquer
+// envio que nao venha do painel (sendText com "auto": ver service.js).
 // import { bot as whatsappBot } from "./src/services/whatsapp/bot.js";
-import { createOverdueReminders } from "./src/services/whatsapp/overdue.js";
+// import { createOverdueReminders } from "./src/services/whatsapp/overdue.js";
 import { createRetention } from "./src/services/whatsapp/retention.js";
 import { createInboxWatch } from "./src/services/whatsapp/inboxWatch.js";
 
-// Aviso automatico de atraso pelo WhatsApp (services/whatsapp/overdue.js):
-// UM por emprestimo, 1 dia depois do prazo, e nada mais.
-// (antes: createOverdueReminders({ whatsapp, bot: whatsappBot }))
-const overdueReminders = createOverdueReminders({ whatsapp });
+// (aviso automatico de atraso, DESLIGADO em 13/11/2026)
+// const overdueReminders = createOverdueReminders({ whatsapp });
 // Mensagem recebida: anota o link de solicitacao e manda a notificacao do
 // app aos administradores que escolheram "Mensagens" (nao responde nada).
 const inboxWatch = createInboxWatch({ whatsapp });
@@ -537,7 +536,7 @@ function shutDown(signal) {
   });
   // whatsappBot.stop(); // (robo desligado)
   inboxWatch.stop();
-  overdueReminders.stop();
+  // overdueReminders.stop(); // (aviso automatico de atraso desligado)
   whatsappRetention.stop();
   Promise.race([drained, wait(8000)])
     .then(() => Promise.race([whatsapp.shutdown(), wait(5000)]))
@@ -557,10 +556,9 @@ connectDatabase()
       // Reconecta o WhatsApp da biblioteca se ja houver sessao salva. Roda em
       // segundo plano: nao segura a subida do servidor.
       whatsapp.start();
-      // Aviso de atraso: so age com o WhatsApp conectado neste servidor.
-      // (O atendimento automatico - whatsappBot.start() - foi desligado.)
+      // (O atendimento automatico - whatsappBot.start() - e o aviso de
+      // atraso - overdueReminders.start() - foram desligados: nada sai sozinho.)
       inboxWatch.start();
-      overdueReminders.start();
       whatsappRetention.start();
     });
   })

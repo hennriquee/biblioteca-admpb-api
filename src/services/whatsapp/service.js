@@ -9,6 +9,7 @@ import makeWASocket, {
   proto,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
+import LoanRequest from '../../models/LoanRequest.js';
 import Setting from '../../models/Setting.js';
 import WaAuth from '../../models/WaAuth.js';
 import WaChat from '../../models/WaChat.js';
@@ -62,6 +63,8 @@ import {
  *
  * Estados (state):
  * - disabled      desligado neste servidor (WHATSAPP_ENABLED=false);
+ * - sleeping      sessao salva, conexao fechada DE PROPOSITO (sob demanda:
+ *                 ninguem nas Conversas); abre ao entrar na tela;
  * - idle          sem conexao e sem tentativa em andamento (falta o QR);
  * - standby       outra copia do servidor esta com a conexao (lease.js);
  * - connecting    abrindo a conexao;
@@ -94,6 +97,11 @@ export class WhatsAppError extends Error {
 const FALSY = new Set(['false', '0', 'no', 'off', 'nao', 'não']);
 // (settings) Envios das ultimas 24 h de conversas apagadas: ver keepSendCounts.
 const SENT_LOG = 'whatsapp-sent-log';
+// (settings) De qual numero sao as conversas do banco (ver #claimNumber), e
+// a saude/restricao do numero (policy.js), que nao passam para um numero novo.
+const NUMBER_KEY = 'whatsapp-number';
+const HEALTH_KEY = 'whatsapp-health';
+const RESTRICTION_KEY = 'whatsapp-restriction';
 
 /**
  * Ligado por padrao SO no Render (que define RENDER=true): em qualquer outro
@@ -122,14 +130,48 @@ export function readDisappearDays(env = process.env) {
   return days > 0 && days < 1 ? 1 : days;
 }
 
+// De quantas em quantas horas a conexao sob demanda abre sozinha para buscar
+// o que chegou (WHATSAPP_SYNC_HOURS, padrao 3; 0 = nunca; minimo meia hora).
+function readSyncMs(env) {
+  const raw = String(env.WHATSAPP_SYNC_HOURS ?? '').trim();
+  const hours = raw ? Number(raw.replace(',', '.')) : 3;
+  if (!Number.isFinite(hours) || hours < 0) return 3 * 60 * 60 * 1000;
+  if (hours === 0) return 0;
+  return Math.max(0.5, hours) * 60 * 60 * 1000;
+}
+
 export function readConfig(env = process.env) {
-  const number = digitsOf(env.WHATSAPP_NUMBER || '5491164610665');
+  const number = digitsOf(env.WHATSAPP_NUMBER || '13657963315');
   return {
     // Dias ate cada mensagem sumir do painel (0 = nunca).
     disappearDays: readDisappearDays(env),
     enabled: isEnabled(env),
-    // O numero da biblioteca: +54 9 11 6461-0665.
+    // O numero da biblioteca: +1 365 796 3315 (Canada, desde 13/11/2026; o
+    // anterior era o argentino +54 9 11 6461-0665).
     number,
+    // CONEXAO SOB DEMANDA (padrao; WHATSAPP_MODE=always volta ao antigo,
+    // conectado o tempo todo): o servidor so fica conectado ao WhatsApp
+    // enquanto um administrador esta na tela Conversas (e um pouco depois).
+    // Fora disso a conexao fica FECHADA (a sessao continua salva, sem QR) e
+    // abre sozinha de tempos em tempos (syncEveryMs) por alguns minutos, so
+    // para receber o que chegou - como alguem que abre o WhatsApp Web, olha
+    // e fecha. O WhatsApp guarda as mensagens para o aparelho e entrega tudo
+    // quando ele conecta de novo.
+    mode: String(env.WHATSAPP_MODE ?? '').trim().toLowerCase() === 'always' ? 'always' : 'on-demand',
+    // Sem ninguem nas Conversas por este tempo (sorteado), a conexao fecha.
+    awakeIdleMs: [6 * 60 * 1000, 11 * 60 * 1000],
+    // As idas sozinhas: de quanto em quanto tempo (+-20%), por quanto tempo
+    // e em que horario de Brasilia (fora dele, so na proxima).
+    syncEveryMs: readSyncMs(env),
+    syncStayMs: [2 * 60 * 1000, 4 * 60 * 1000],
+    syncFromHour: 7,
+    syncToHour: 22,
+    // So fecha depois deste tempo sem chegar nada (o WhatsApp entrega as
+    // mensagens guardadas aos poucos logo depois de conectar).
+    quietMs: 20 * 1000,
+    // Depois de conectar, fica aberta pelo menos isto (a entrega do que
+    // estava guardado comeca logo, mas pode demorar alguns segundos).
+    minOpenMs: 60 * 1000,
     // Teto de mensagens enviadas pelo painel nas ultimas 24 horas.
     dailyLimit: Number(env.WHATSAPP_DAILY_LIMIT) > 0 ? Number(env.WHATSAPP_DAILY_LIMIT) : 300,
     logLevel: env.WHATSAPP_LOG_LEVEL || 'warn',
@@ -289,6 +331,14 @@ export class WhatsAppService {
   #forbidden = 0;
   #last463 = 0;
   #capStatus = '';
+  // Conexao sob demanda: ate quando ela deve ficar aberta, o relogio que a
+  // fecha, o que a abre sozinha, quando chegou o ultimo evento e quantos
+  // envios estao em andamento (nada fecha no meio de um).
+  #awakeUntil = 0;
+  #sleepTimer = null;
+  #syncTimer = null;
+  #lastEventAt = 0;
+  #inflight = 0;
 
   constructor(overrides = {}) {
     this.#init(overrides);
@@ -344,7 +394,10 @@ export class WhatsAppService {
       state: this.#state,
       connected: this.#state === 'open',
       qr: this.#state === 'qr' ? this.#qr : null,
-      hasSession: Boolean(this.#auth?.state?.creds?.me),
+      // (dormindo: a sessao esta salva no banco, so nao carregada agora)
+      hasSession: Boolean(this.#auth?.state?.creds?.me) || this.#state === 'sleeping',
+      // "on-demand" (conecta so com alguem nas Conversas) ou "always".
+      mode: this.#cfg.mode,
       // Sessao quebrada: o painel oferece apagar e ler o QR de novo.
       broken: this.#broken,
       number: this.#cfg.number,
@@ -383,10 +436,147 @@ export class WhatsAppService {
       })
       .catch((error) => console.error('WhatsApp: não foi possível registrar os contatos:', error.message));
     try {
-      if (await this.#sessionExists()) await this.connect({ auto: true });
+      if (await this.#sessionExists()) {
+        // Sob demanda: ao subir, uma ida curta para buscar o que chegou com o
+        // servidor fora do ar (e conferir o numero); depois, dorme.
+        if (this.#onDemand()) this.#extendAwake(this.#pick(this.#cfg.syncStayMs));
+        await this.connect({ auto: true });
+      }
     } catch (error) {
       console.error('WhatsApp: não foi possível iniciar:', error.message);
     }
+  }
+
+  // ---------- Conexao sob demanda ----------
+
+  #onDemand() {
+    return this.#cfg.enabled && this.#cfg.mode === 'on-demand';
+  }
+
+  #pick([min, max]) {
+    return Math.round(between(min, max, this.#rng));
+  }
+
+  // Alguem quer a conexao aberta ate (pelo menos) daqui a ms.
+  #extendAwake(ms) {
+    this.#awakeUntil = Math.max(this.#awakeUntil, this.#now() + ms);
+    this.#scheduleSleep();
+  }
+
+  #wanted() {
+    return this.#now() < this.#awakeUntil;
+  }
+
+  /**
+   * Um administrador esta usando as Conversas (as rotas do painel chamam a
+   * cada consulta): a conexao abre, se estava dormindo, e fica aberta ate uns
+   * minutos depois da ultima consulta. Sem efeito com WHATSAPP_MODE=always.
+   */
+  touch() {
+    if (!this.#onDemand() || this.#closing) return;
+    this.#extendAwake(this.#pick(this.#cfg.awakeIdleMs));
+    if (this.#state === 'sleeping') this.connect({ auto: true }).catch(() => {});
+  }
+
+  #scheduleSleep(ms) {
+    if (!this.#onDemand() || this.#closing) return;
+    clearTimeout(this.#sleepTimer);
+    const wait = Math.max(1000, ms ?? this.#awakeUntil - this.#now());
+    this.#sleepTimer = setTimeout(() => {
+      this.#maybeSleep().catch((error) => {
+        console.error('WhatsApp: não foi possível fechar a conexão ociosa:', error.message);
+      });
+    }, wait);
+    this.#sleepTimer.unref?.();
+  }
+
+  // Ninguem mais nas Conversas: fecha (sem desvincular) se nada estiver
+  // chegando nem saindo agora.
+  async #maybeSleep() {
+    if (!this.#onDemand() || this.#closing) return;
+    if (this.#wanted()) return this.#scheduleSleep();
+    const busy =
+      this.#connecting ||
+      this.#inflight > 0 ||
+      this.#busy > 0 ||
+      this.#now() - this.#lastEventAt < this.#cfg.quietMs;
+    if (busy) return this.#scheduleSleep(Math.min(15 * 1000, this.#cfg.quietMs));
+    const registered = Boolean(this.#auth?.state?.creds?.me);
+    // Vinculando (QR na tela) ou sem sessao: nao ha o que fechar - o QR vence sozinho.
+    if (!registered) return undefined;
+    if (['open', 'connecting', 'reconnecting'].includes(this.#state)) {
+      await this.#goToSleep();
+    } else if (this.#state === 'standby') {
+      await this.#sleepNow();
+    }
+    return undefined;
+  }
+
+  /** Fecha a conexao aberta SEM desvincular: a sessao continua salva. */
+  async #goToSleep() {
+    const sock = this.#sock;
+    if (sock && this.#online) {
+      await withTimeout(Promise.resolve(sock.sendPresenceUpdate?.('unavailable')), 3000).catch(() => {});
+    }
+    // Termina de gravar o que ja chegou: depois de fechar, o que estiver na
+    // fila deste socket seria ignorado (e o WhatsApp ja considera entregue).
+    const deadline = this.#now() + 20 * 1000;
+    for (;;) {
+      const queue = this.#queue;
+      const history = this.#historyQueue;
+      await Promise.race([Promise.all([queue, history]), this.#wait(Math.max(0, deadline - this.#now()))]);
+      if ((queue === this.#queue && history === this.#historyQueue) || this.#now() >= deadline) break;
+    }
+    // Alguem voltou as Conversas (ou um envio comecou) enquanto esperava.
+    if (this.#wanted() || this.#inflight > 0 || this.#busy > 0) return this.#scheduleSleep();
+    if (this.#sock !== sock) return undefined; // a conexao ja mudou sozinha
+    this.#teardownSocket();
+    // Ja e "dormindo" para quem pergunta (o status nao diz "conectado" sem
+    // conexao, e quem voltar as Conversas agora reconecta na hora).
+    this.#setState('sleeping', '');
+    // A sessao e gravada inteira antes de soltar a trava; a proxima abertura
+    // le do banco (outra copia do servidor pode conectar no meio).
+    await this.#auth?.flush?.()?.catch?.(() => {});
+    // Alguem reconectou enquanto gravava: a conexao nova usa esta sessao e
+    // esta trava - nada de soltar.
+    if (this.#sock || this.#connecting || this.#state !== 'sleeping') return this.#scheduleSleep();
+    this.#auth = null;
+    await this.#sleepNow();
+    // E se alguem voltou as Conversas bem agora, abre de novo.
+    if (this.#wanted()) this.connect({ auto: true }).catch(() => {});
+    return undefined;
+  }
+
+  async #sleepNow() {
+    clearTimeout(this.#retryTimer);
+    clearTimeout(this.#sleepTimer);
+    this.#stopHeartbeat();
+    await this.#lease.release().catch(() => {});
+    this.#setState(
+      'sleeping',
+      'Conectado só enquanto alguém usa as Conversas. Abrindo esta tela, ele conecta em instantes.'
+    );
+    this.#scheduleSync();
+  }
+
+  // Dormindo: abre sozinho de tempos em tempos, so para receber o que chegou.
+  #scheduleSync() {
+    clearTimeout(this.#syncTimer);
+    const every = this.#cfg.syncEveryMs;
+    if (!this.#onDemand() || !every || this.#closing) return;
+    this.#syncTimer = setTimeout(() => this.#syncNow(), Math.round(every * (0.8 + this.#rng() * 0.4)));
+    this.#syncTimer.unref?.();
+  }
+
+  #syncNow() {
+    if (this.#state !== 'sleeping' || this.#closing) return;
+    const hour = brazilHour(new Date(this.#now()));
+    if (hour < this.#cfg.syncFromHour || hour >= this.#cfg.syncToHour) {
+      this.#scheduleSync();
+      return;
+    }
+    this.#extendAwake(this.#pick(this.#cfg.syncStayMs));
+    this.connect({ auto: true }).catch(() => {});
   }
 
   /** Abre a conexao (e o QR, se faltar a sessao). Pode ser chamado a vontade. */
@@ -398,7 +588,20 @@ export class WhatsAppService {
     }
     this.#connecting = true;
     clearTimeout(this.#retryTimer);
+    clearTimeout(this.#syncTimer);
     try {
+      // Sob demanda: nova tentativa automatica (queda, trava, ida sozinha que
+      // ja passou) sem ninguem nas Conversas - dorme em vez de conectar.
+      if (auto && this.#onDemand() && !this.#wanted()) {
+        const saved = Boolean(this.#auth?.state?.creds?.me) || (await this.#sessionExists());
+        if (saved) {
+          // (o socket que caiu ja saiu em #onClose; o que ainda estiver na
+          // fila dele termina de gravar)
+          if (this.#sock) this.#teardownSocket();
+          await this.#sleepNow();
+          return this.snapshot();
+        }
+      }
       if (!(await this.#lease.acquire())) {
         this.#setState(
           'standby',
@@ -420,6 +623,31 @@ export class WhatsAppService {
         this.#setState(
           'unreadable',
           'A sessão salva não pôde ser lida (a chave de segurança mudou). Apague a sessão e leia o QR de novo.'
+        );
+        return this.snapshot();
+      }
+      // O NUMERO DA BIBLIOTECA MUDOU (WHATSAPP_NUMBER): a sessao salva e do
+      // numero antigo. Nao conecta com ela (se a conta antiga estiver
+      // bloqueada, o servidor ficaria tentando para sempre e o QR nunca
+      // apareceria): apaga e pede o QR do numero novo.
+      const savedMe = phoneFromJid(auth.state?.creds?.me?.id || '');
+      if (savedMe && !samePhone(savedMe, this.#cfg.number)) {
+        console.warn(
+          'WhatsApp: a sessão salva é de outro número (' + lastDigits(savedMe) + '). O número da biblioteca mudou: sessão antiga apagada.'
+        );
+        await auth.clear();
+        this.#auth = null;
+        this.#broken = false;
+        this.#attempts = 0;
+        this.#stopHeartbeat();
+        await this.#lease.release().catch(() => {});
+        this.#setState(
+          'idle',
+          'O número da biblioteca mudou para +' +
+            this.#cfg.number +
+            '. A conexão do número antigo (' +
+            lastDigits(savedMe) +
+            ') foi apagada deste servidor. Leia o QR code com o celular do número novo.'
         );
         return this.snapshot();
       }
@@ -521,6 +749,7 @@ export class WhatsAppService {
   // fica numa fila SEPARADA, para nao segurar as mensagens que chegam ao vivo.
   // (Tudo que se grava e idempotente, entao as duas filas nao se atrapalham.)
   #enqueueHistory(gen, task) {
+    this.#lastEventAt = this.#now(); // (sob demanda: nao fecha com o historico chegando)
     this.#historyQueue = this.#historyQueue.then(async () => {
       if (gen !== this.#gen) return;
       try {
@@ -533,6 +762,7 @@ export class WhatsAppService {
   }
 
   #enqueue(gen, task) {
+    this.#lastEventAt = this.#now(); // (sob demanda: nao fecha com mensagens chegando)
     this.#queue = this.#queue.then(async () => {
       if (gen !== this.#gen) return;
       try {
@@ -552,6 +782,10 @@ export class WhatsAppService {
     if (update.reachoutTimeLock) await this.#onRestriction(update.reachoutTimeLock);
 
     if (qr) {
+      // Antes de o numero ser vinculado: o que era de OUTRO numero sai do
+      // banco (ver #claimNumber).
+      await this.#claimNumber();
+      if (gen !== this.#gen) return;
       this.#qr = qr;
       // Pediu QR: o proximo "aberto" e um vinculo NOVO (aquecimento recomeca).
       this.#freshLink = true;
@@ -613,7 +847,72 @@ export class WhatsAppService {
       this.#warmupAt = new Date(this.#now());
       restartWarmup(this.#now()).catch(() => {});
     }
+    // De qual numero sao as conversas e os contatos do banco (#claimNumber).
+    // Com nova tentativa: sem esta anotacao, o proximo QR acharia que o
+    // numero mudou e apagaria as conversas do numero ATUAL.
+    await retrying(() =>
+      Setting.updateOne(
+        { _id: NUMBER_KEY },
+        { $set: { value: { number: this.#cfg.number, at: new Date(this.#now()).toISOString() } } },
+        { upsert: true }
+      )
+    ).catch((error) => console.error('WhatsApp: não foi possível anotar o número conectado:', error.message));
+    if (sock !== this.#sock) return;
     this.#setState('open');
+    if (this.#onDemand()) {
+      // Fica pelo menos um minuto: o WhatsApp entrega o que estava guardado
+      // logo depois de conectar.
+      this.#extendAwake(this.#cfg.minOpenMs);
+    }
+  }
+
+  /**
+   * NUMERO NOVO: as conversas, os contatos ("quem ja escreveu"), a saude e a
+   * restricao guardados no banco sao do numero que estava vinculado antes.
+   * Misturar isso com o numero novo faria o fiscal achar que quem escreveu
+   * para o numero ANTIGO ja conhece o novo (e liberar mensagens para uma
+   * "lista fria" - o que a Meta mais pune) e juntaria mensagens de dois
+   * numeros na mesma conversa. Roda quando o QR aparece (antes de vincular):
+   * se o numero anotado (settings > whatsapp-number, gravado a cada conexao)
+   * nao e o de agora - ou nao ha anotacao -, apaga tudo isso e anota o novo.
+   * As mensagens de antes somem do painel (de todo modo sumiriam em 7 dias).
+   */
+  async #claimNumber() {
+    try {
+      const doc = await Setting.findById(NUMBER_KEY).lean();
+      if (doc?.value?.number && samePhone(doc.value.number, this.#cfg.number)) return;
+      const [chats, messages, contacts] = await Promise.all([
+        WaChat.deleteMany({}),
+        WaMessage.deleteMany({}),
+        WaContact.deleteMany({}),
+        // (a "vez" - floor.js - apontava para uma conversa que sai agora)
+        Setting.deleteMany({ _id: { $in: [HEALTH_KEY, RESTRICTION_KEY, SENT_LOG, 'whatsapp-floor'] } }),
+        // (solicitacoes que apontavam para uma conversa que saiu)
+        LoanRequest.updateMany({ waChat: { $ne: null } }, { $set: { waChat: null } }),
+      ]);
+      this.#restriction = null;
+      await Setting.updateOne(
+        { _id: NUMBER_KEY },
+        { $set: { value: { number: this.#cfg.number, at: new Date(this.#now()).toISOString() } } },
+        { upsert: true }
+      );
+      if (chats.deletedCount || messages.deletedCount || contacts.deletedCount) {
+        console.warn(
+          'WhatsApp: número novo (+' +
+            this.#cfg.number +
+            '). Saíram do painel ' +
+            (chats.deletedCount || 0) +
+            ' conversa(s), ' +
+            (messages.deletedCount || 0) +
+            ' mensagem(ns) e ' +
+            (contacts.deletedCount || 0) +
+            ' contato(s) do número anterior.'
+        );
+      }
+    } catch (error) {
+      // Sem a anotacao gravada, tenta de novo no proximo QR.
+      console.error('WhatsApp: não foi possível preparar o banco para o número novo:', error.message);
+    }
   }
 
   /** Alguem leu o QR com outro numero: desvincula e apaga a sessao. */
@@ -817,6 +1116,8 @@ export class WhatsAppService {
   async shutdown() {
     this.#closing = true;
     clearTimeout(this.#retryTimer);
+    clearTimeout(this.#sleepTimer);
+    clearTimeout(this.#syncTimer);
     this.#stopHeartbeat();
     this.#teardownSocket();
     await this.#queue.catch(() => {});
@@ -1572,7 +1873,26 @@ export class WhatsAppService {
    * a conversa nesse meio tempo): false = SUPERSEDED, nada sai.
    * Toda mensagem passa pelo fiscal (audit) antes.
    */
-  async sendText(chat, text, { auto = '', typing = null, online = false, guard = null } = {}) {
+  async sendText(chat, text, options = {}) {
+    // NENHUMA MENSAGEM AUTOMATICA (desde 13/11/2026): so sai o que um
+    // administrador digitou no painel. Robo, aviso de atraso ou qualquer
+    // outro envio "do sistema" e recusado aqui, mesmo que alguem religue.
+    if (options.auto) {
+      throw new WhatsAppError(
+        'AUTO_OFF',
+        'O WhatsApp da biblioteca não envia mensagens automáticas: só o que um administrador escreve nas Conversas.',
+        403
+      );
+    }
+    this.#inflight += 1;
+    try {
+      return await this.#sendText(chat, text, options);
+    } finally {
+      this.#inflight -= 1;
+    }
+  }
+
+  async #sendText(chat, text, { auto = '', typing = null, online = false, guard = null } = {}) {
     await this.assertCanSend({ auto });
     const verdict = await this.audit(chat, text, { auto });
     const jid = await this.#targetJid(this.#requireOpen(), chat);
