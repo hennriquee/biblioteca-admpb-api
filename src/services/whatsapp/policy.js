@@ -129,6 +129,34 @@ export function limitsFor(cfg, day) {
 const SHORTENERS =
   /\b(?:bit\.ly|tinyurl\.com|goo\.gl|t\.co|ow\.ly|is\.gd|buff\.ly|cutt\.ly|rebrand\.ly|shorturl\.at|encurtador\.com\.br|tiny\.cc|rb\.gy|s\.id|v\.gd|t\.ly|lnkd\.in)\/\S*/i;
 const LINK = /\bhttps?:\/\/\S+|\bwww\.\S+/gi;
+// Qualquer coisa que o WhatsApp mostra como link (tambem sem "https://", como
+// "site.com.br/x" ou "wa.me/..."). Sem "g": .test() com "g" guarda a posicao.
+// Terminacao: as de pais que existem (IANA: .br, .la, .be, .ee, .us, .to,
+// .me...; "Chegou.Um" ou "ontem.Ok" nao viram link, porque .um/.ok nao
+// existem) ou um dos nomes genericos comuns. (Antes do "dominio": nem letra,
+// numero, "@" - e-mail - nem um "x." de outro dominio; "..." pode.)
+const COUNTRY_TLDS =
+  'ac ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bm bn bo bq br bs bt bw by bz ' +
+  'ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg er es et eu fi fj fk fm fo fr ' +
+  'ga gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir is it je jm jo jp ' +
+  'ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mg mh mk ml mm mn mo mp mq mr ms mt ' +
+  'mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru ' +
+  'rw sa sb sc sd se sg sh si sk sl sm sn so sr ss st su sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ' +
+  'ua ug uk us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw';
+const TLD =
+  '(?:com|net|org|info|biz|app|dev|page|site|online|xyz|top|shop|store|click|link|live|life|church|blog|news|club|website|space|tech|digital|email|art|fun|vip|pro|gov|edu|mobi|name|social|chat|one|world|today|bio|gle|gospel|faith|bible|' +
+  COUNTRY_TLDS.split(' ').join('|') +
+  ')';
+const LINK_ONE = new RegExp(
+  '\\bhttps?:\\/\\/\\S+|\\bwww\\.\\S+|(?<![\\p{L}\\d@-]|[\\p{L}\\d-]\\.)[\\p{L}\\d-]+(?:\\.[\\p{L}\\d-]+)*\\.' + TLD + '(?![\\p{L}\\d-])(?:\\/\\S*)?',
+  'iu'
+);
+
+/** O primeiro pedaco do texto que o WhatsApp mostraria como link ('' = nenhum). */
+export function firstLink(text) {
+  const match = String(text || '').match(LINK_ONE);
+  return match ? match[0].slice(0, 60) : '';
+}
 const MONEY = /\b(pix|boleto|pagamento|pagar|multa|cobranca|cobrança|r\$|deposito|depósito|fatura|divida|dívida)\b/i;
 const EMOJI = /\p{Extended_Pictographic}/gu;
 
@@ -221,6 +249,31 @@ export function auditOutgoing(ctx, cfg = readPolicyConfig()) {
   }
   if (proactive && (hour < cfg.fromHour || hour >= cfg.toHour)) {
     blocks.push({ rule: 'QUIET_HOURS', msg: 'Fora do horário (9h às 20h de Brasília).' });
+  }
+  // PRIMEIRA MENSAGEM PELO PAINEL a quem nunca escreveu para o numero: de um
+  // numero estrangeiro e fora dos contatos da pessoa, e o que mais vira
+  // "bloquear e denunciar" - e denuncia e o que mais pesa para a Meta. De
+  // noite ou com link (cara de golpe), espera.
+  if (coldPanel && (hour < cfg.fromHour || hour >= cfg.toHour)) {
+    blocks.push({
+      rule: 'COLD_QUIET_HOURS',
+      msg:
+        'Essa pessoa nunca escreveu para o número da biblioteca: a primeira mensagem só sai das ' +
+        cfg.fromHour +
+        'h às ' +
+        cfg.toHour +
+        'h (Brasília). Mensagem de número desconhecido fora desse horário costuma ser denunciada.',
+    });
+  }
+  const link = coldPanel ? firstLink(text) : '';
+  if (link) {
+    blocks.push({
+      rule: 'COLD_LINK',
+      msg:
+        'Essa pessoa nunca escreveu para o número da biblioteca: mande sem link (“' +
+        link +
+        '” vira link no WhatsApp; se não era para ser, ponha um espaço depois do ponto). Link de número desconhecido parece golpe; ele pode ir depois que a pessoa responder.',
+    });
   }
   const paused = health.pausedUntil && new Date(health.pausedUntil).getTime() > now;
   if (proactive && paused) {

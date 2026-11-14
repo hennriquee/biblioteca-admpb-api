@@ -1,7 +1,9 @@
 import makeWASocket, {
   Browsers,
+  DEFAULT_CONNECTION_CONFIG,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
   generateMessageIDV2,
   isLidUser,
   isPnUser,
@@ -196,6 +198,13 @@ export function readConfig(env = process.env) {
     // o dobro, ate este teto (bater na porta de 10 em 10 minutos numa conta
     // restrita so chama mais atencao).
     forbiddenRetryMaxMs: 6 * 60 * 60 * 1000,
+    // Versao do cliente (latestClientVersion): vale por este tempo; depois,
+    // a proxima conexao busca de novo (o WhatsApp Web se atualiza sozinho).
+    versionTtlMs: 6 * 60 * 60 * 1000,
+    // Versao recusada (405): espera antes de tentar de novo com a versao
+    // buscada outra vez; recusas seguidas dobram a espera ate o teto.
+    versionRetryMs: 60 * 1000,
+    versionRetryMaxMs: 60 * 60 * 1000,
     // PRESENCA: "session" (padrao) = como uma pessoa no WhatsApp Web: fica
     // "online" quando vai ler/responder e sai sozinha um tempo sorteado
     // depois da ultima acao. "off" = nunca fica online (so o "digitando…").
@@ -227,6 +236,52 @@ export function readConfig(env = process.env) {
     // As regras do fiscal (policy.js).
     policy: readPolicyConfig(env),
   };
+}
+
+/**
+ * VERSAO DO CLIENTE anunciada ao WhatsApp. A que vem embutida no Baileys (e a
+ * que o fetchLatestBaileysVersion le do repositorio dele) fica parada no dia
+ * em que a biblioteca saiu - em 14/11/2026 era a de julho, meses atras do
+ * WhatsApp Web de verdade. Um "navegador" que nunca se atualiza e marca de
+ * cliente nao oficial, e o WhatsApp recusa (405) a versao velha demais. Por
+ * isso: a versao do proprio WhatsApp Web (web.whatsapp.com) e, sem ela, a do
+ * Baileys; das que vierem, a MAIS NOVA (nunca abaixo da embutida). null = nao
+ * deu para saber (o socket usa a embutida).
+ */
+function compareVersions(a, b) {
+  for (let i = 0; i < 3; i += 1) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+function validVersion(result) {
+  const v = result?.isLatest ? result.version : null;
+  return Array.isArray(v) && v.length === 3 && v.every((n) => Number.isSafeInteger(n) && n >= 0) && v[0] === 2
+    ? v
+    : null;
+}
+
+export async function latestClientVersion({
+  web = fetchLatestWaWebVersion,
+  baileys = fetchLatestBaileysVersion,
+  timeoutMs = 5000,
+  embedded = DEFAULT_CONNECTION_CONFIG.version,
+} = {}) {
+  const found = await Promise.all(
+    [web, baileys].map((fetcher) =>
+      withTimeout(Promise.resolve().then(() => fetcher()), timeoutMs)
+        .then(validVersion)
+        .catch(() => null)
+    )
+  );
+  const sources = ['web.whatsapp.com', 'Baileys'];
+  const list = found.map((version, i) => (version ? { version, source: sources[i] } : null)).filter(Boolean);
+  if (!list.length) return null;
+  const newest = list.sort((a, b) => compareVersions(a.version, b.version)).at(-1);
+  return Array.isArray(embedded) && compareVersions(newest.version, embedded) < 0
+    ? { version: [...embedded], source: 'embutida' }
+    : newest;
 }
 
 function withTimeout(promise, ms, code = 'TIMEOUT', message = 'O WhatsApp demorou demais para responder.') {
@@ -298,6 +353,12 @@ export class WhatsAppService {
   #started = false;
   #closing = false;
   #version;
+  // A versao veio pronta (testes): nunca busca. Senao, quando foi buscada.
+  #versionFixed = false;
+  #versionAt = 0;
+  #versionLookup;
+  // Recusas seguidas da versao (405).
+  #rejectedVersion = 0;
   #retryTimer = null;
   #heartbeat = null;
   #queue = Promise.resolve();
@@ -354,6 +415,9 @@ export class WhatsAppService {
     this.#logger =
       overrides.logger || pino({ level: this.#cfg.logLevel }, pino.destination(2));
     this.#version = overrides.version;
+    this.#versionFixed = overrides.version !== undefined;
+    this.#versionAt = 0;
+    this.#versionLookup = overrides.versionLookup || (() => latestClientVersion());
     this.#wait = overrides.wait || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.#rng = overrides.rng || defaultRng;
     this.#now = overrides.now || (() => Date.now());
@@ -673,21 +737,38 @@ export class WhatsAppService {
     return this.snapshot();
   }
 
+  // A versao do cliente para esta conexao (ver latestClientVersion). Sem
+  // resposta desta vez: a ultima que se soube, senao a embutida (null); a
+  // falha nao e guardada (a proxima conexao tenta de novo).
+  async #clientVersion() {
+    if (this.#versionFixed) return this.#version;
+    const fresh = this.#version && this.#now() - this.#versionAt < this.#cfg.versionTtlMs;
+    if (fresh) return this.#version;
+    const result = await this.#versionLookup().catch(() => null);
+    const found = Array.isArray(result) ? result : result?.version || null;
+    const source = Array.isArray(result) ? '' : result?.source || '';
+    // Um WhatsApp Web de verdade nunca volta de versao: se so respondeu a
+    // fonte mais atrasada (a do Baileys), fica a que ja se sabia. (Depois de
+    // um 405 a guardada e apagada, e vale a que vier.)
+    if (found && !(this.#version && compareVersions(found, this.#version) < 0)) {
+      if (!this.#version || compareVersions(found, this.#version) !== 0) {
+        console.log('WhatsApp: versão do cliente ' + found.join('.') + (source ? ' (' + source + ')' : '') + '.');
+      }
+      this.#version = found;
+      this.#versionAt = this.#now();
+    } else if (found) {
+      // (a guardada continua valendo por mais um prazo)
+      this.#versionAt = this.#now();
+    } else if (!this.#version) {
+      console.warn('WhatsApp: não foi possível saber a versão atual do WhatsApp Web; vai a embutida no Baileys.');
+    }
+    return this.#version || null;
+  }
+
   async #open() {
     const gen = ++this.#gen;
     const auth = this.#auth;
-    let version = this.#version;
-    if (version === undefined) {
-      try {
-        const latest = await withTimeout(fetchLatestBaileysVersion(), 5000);
-        version = latest?.version || null;
-        this.#version = version;
-      } catch {
-        // Sem a versao nova desta vez: usa a embutida no Baileys, e tenta de
-        // novo na proxima conexao (nao guarda a falha).
-        version = null;
-      }
-    }
+    const version = await this.#clientVersion();
     if (gen !== this.#gen) return;
 
     const sock = this.#socketFactory({
@@ -821,6 +902,7 @@ export class WhatsAppService {
     }
     this.#attempts = 0;
     this.#forbidden = 0;
+    this.#rejectedVersion = 0;
     this.#broken = false;
     this.#online = false;
     this.#subscribed.clear();
@@ -1010,6 +1092,36 @@ export class WhatsAppService {
       const retry = Math.min(this.#cfg.forbiddenRetryMaxMs, this.#cfg.slowRetryMs * 2 ** Math.min(this.#forbidden, 10));
       this.#forbidden += 1;
       this.#scheduleRetry(Math.round(retry * (0.85 + this.#rng() * 0.3)));
+      return;
+    }
+
+    // 405: o WhatsApp recusou a VERSAO do cliente (velha demais). Antes caia
+    // na reconexao comum - de minuto em minuto, sempre com a mesma versao
+    // guardada. Agora esquece a versao (a proxima conexao busca de novo; sem
+    // resposta, usa a embutida) e espera, dobrando a cada recusa seguida.
+    if (code === 405) {
+      if (!this.#versionFixed) this.#version = null;
+      this.#versionAt = 0;
+      this.#stopHeartbeat();
+      await this.#lease.release().catch(() => {});
+      if (!registered) {
+        // Vinculando: nada de gerar QR sozinho sem parar.
+        this.#setState(
+          'idle',
+          'O WhatsApp recusou a conexão deste servidor agora (código 405). Espere alguns minutos e toque em “Gerar o QR code” de novo.'
+        );
+        return;
+      }
+      const wait = Math.min(this.#cfg.versionRetryMaxMs, this.#cfg.versionRetryMs * 2 ** Math.min(this.#rejectedVersion, 10));
+      this.#rejectedVersion += 1;
+      console.warn('WhatsApp: versão do cliente recusada (405). Nova tentativa com a versão atualizada em ' + Math.round(wait / 1000) + ' s.');
+      const ms = Math.round(wait * (0.85 + this.#rng() * 0.3));
+      const minutes = Math.max(1, Math.round(ms / 60000));
+      this.#setState(
+        'reconnecting',
+        'O WhatsApp pediu uma versão mais nova. Nova tentativa em ' + (minutes === 1 ? 'cerca de 1 minuto' : 'cerca de ' + minutes + ' minutos') + '.'
+      );
+      this.#scheduleRetry(ms);
       return;
     }
 
